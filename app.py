@@ -22,7 +22,9 @@ PAYMENTS = ("Cash", "UPI", "Card")
 DEFAULT_SETTINGS = {"name": "Guns & Roses Café", "address": "Kondapur, Hyderabad", "phone": "", "gstin": "", "fssai": "",
                     "tax_pct": "5", "tables": "8", "footer": "Thank you! Visit again.",
                     "printer": "", "paper": "58",  # printer: "" = tablet's print dialog, else COM port of a thermal printer
-                    "pin": os.environ.get("POS_PIN") or "1234"}  # set POS_PIN when hosting so a fresh site never has 1234
+                    "pin": os.environ.get("POS_PIN") or "1234",  # staff PIN; set POS_PIN when hosting so a fresh site never has 1234
+                    "owner_pin": os.environ.get("POS_OWNER_PIN") or ""}  # blank = the staff PIN also has owner rights
+SECRET_SETTINGS = ("pin", "owner_pin")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL,
@@ -41,6 +43,17 @@ CREATE TABLE IF NOT EXISTS lines(id INTEGER PRIMARY KEY, order_id INTEGER NOT NU
     qty INTEGER NOT NULL CHECK(qty > 0));
 CREATE INDEX IF NOT EXISTS lines_order ON lines(order_id);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+-- one row per payment on a bill: split payments (Cash 500 + UPI rest) or a table split between people
+CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL REFERENCES orders,
+    method TEXT NOT NULL, amount INTEGER NOT NULL CHECK(amount > 0));
+CREATE INDEX IF NOT EXISTS payments_order ON payments(order_id);
+CREATE TABLE IF NOT EXISTS refunds(id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL REFERENCES orders, at TEXT NOT NULL,
+    day TEXT NOT NULL, amount INTEGER NOT NULL CHECK(amount > 0), method TEXT NOT NULL, reason TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS refunds_day ON refunds(day);
+-- who did what: cancels, removed items, voids, refunds, discounts, menu/settings changes, day close
+CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, at TEXT NOT NULL, day TEXT NOT NULL, role TEXT NOT NULL,
+    device TEXT, ip TEXT, action TEXT NOT NULL, order_id INTEGER, amount INTEGER, reason TEXT, detail TEXT);
+CREATE INDEX IF NOT EXISTS audit_day ON audit(day);
 """
 
 
@@ -56,7 +69,18 @@ def init(con):
         con.executescript(SCHEMA)
         if "day_no" not in {r[1] for r in con.execute("PRAGMA table_info(orders)")}:
             con.execute("ALTER TABLE orders ADD COLUMN day_no INTEGER")  # databases from before daily bill numbers
+        cols = {r[1] for r in con.execute("PRAGMA table_info(orders)")}
+        for c in ("voided", "void_reason"):  # voided bills keep their number (GST) but leave the totals
+            if c not in cols:
+                con.execute(f"ALTER TABLE orders ADD COLUMN {c} TEXT")
+        if "client_id" not in {r[1] for r in con.execute("PRAGMA table_info(kots)")}:
+            con.execute("ALTER TABLE kots ADD COLUMN client_id TEXT")  # tablet's id for a KOT, so offline resends don't double up
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS kots_client ON kots(client_id) WHERE client_id IS NOT NULL")
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS bill_no_per_day ON orders(day, day_no)")
+        # bills from before split payments: one payment row for the whole total
+        con.execute("INSERT INTO payments(order_id, method, amount) SELECT id, payment, total FROM orders o "
+                    "WHERE status = 'billed' AND payment IS NOT NULL AND total > 0 "
+                    "AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.order_id = o.id)")
         con.executemany("INSERT OR IGNORE INTO settings VALUES(?, ?)", DEFAULT_SETTINGS.items())
         # Business day: bills go to this date until staff press "Close day", so reopening the app or
         # billing after midnight never splits a day. Existing databases continue their latest billed day.
@@ -126,7 +150,48 @@ def order_out(con, r):
         "JOIN kots k ON k.id = l.kot_id WHERE l.order_id = ? ORDER BY l.id", (r["id"],))]
     o["amount"] = sum(l["price"] * l["qty"] for l in o["lines"])
     o["pending"] = len({l["kot_id"] for l in o["lines"] if l["kot_status"] == "new"})
+    if o["status"] == "billed":
+        o["payments"] = [dict(p) for p in con.execute("SELECT method, amount FROM payments WHERE order_id = ? ORDER BY id", (r["id"],))]
+        o["refunded"] = con.execute("SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE order_id = ?", (r["id"],)).fetchone()[0]
     return o
+
+
+# ---- roles and the audit trail ----
+def role_for(s, given):
+    """'owner', 'staff' or None. Until an owner PIN is set, the one PIN does everything (as before)."""
+    g = (given or "").encode()
+    if s.get("owner_pin") and hmac.compare_digest(g, s["owner_pin"].encode()):
+        return "owner"
+    if hmac.compare_digest(g, s["pin"].encode()):
+        return "staff" if s.get("owner_pin") else "owner"
+    return None
+
+
+class Forbidden(Exception):
+    pass
+
+
+def need_owner(d, what="This"):
+    if (d.get("_who") or {}).get("role", "owner") != "owner":  # no _who = called from code/tests
+        raise Forbidden(f"{what} needs the owner PIN")
+
+
+def need_reason(d):
+    r = str(d.get("reason") or "").strip()[:200]
+    if len(r) < 3:
+        raise ValueError("please type a reason (at least 3 letters)")
+    return r
+
+
+def audit(con, d, action, order_id=None, amount=None, reason=None, detail=None, day=None):
+    w = d.get("_who") or {}
+    con.execute("INSERT INTO audit(at, day, role, device, ip, action, order_id, amount, reason, detail) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (now(), day or business_day(con), w.get("role", "system"), w.get("device"), w.get("ip"), action, order_id,
+                 amount, reason, detail))
+    log.warning("AUDIT %s by %s%s%s%s%s", action, w.get("role", "system"),
+                f" on {w['device']}" if w.get("device") else "", f", order #{order_id}" if order_id else "",
+                f", {rs(amount)}" if amount else "", f": {reason}" if reason else "")
 
 
 def get_order(con, oid):
@@ -135,7 +200,9 @@ def get_order(con, oid):
 
 # ---- GET routes (con, query) ----
 def state(con, q):
-    return {"settings": {k: v for k, v in settings(con).items() if k != "pin"},
+    s = settings(con)
+    return {"settings": {k: v for k, v in s.items() if k not in SECRET_SETTINGS},
+            "role": (q.get("_who") or {}).get("role", "owner"), "owner_pin_set": bool(s.get("owner_pin")),
             "items": [dict(r) for r in con.execute(
                 "SELECT id, name, category, price FROM items WHERE active = 1 ORDER BY id")],  # menu.csv order
             "orders": [order_out(con, r) for r in con.execute("SELECT * FROM orders WHERE status = 'open' ORDER BY id")]}
@@ -154,22 +221,79 @@ def kitchen(con, q):
 
 def report(con, q):
     day = q.get("day", [date.today().isoformat()])[0]
-    bills = [order_out(con, r) for r in con.execute(
+    every = [order_out(con, r) for r in con.execute(
         "SELECT * FROM orders WHERE status = 'billed' AND day = ? ORDER BY COALESCE(day_no, bill_no) DESC", (day,))]
+    bills = [b for b in every if not b.get("voided")]  # voided bills keep their number but don't count
     pay, typ, items = {}, {}, {}
     for b in bills:
-        pay[b["payment"]] = pay.get(b["payment"], 0) + b["total"]
+        for p in b["payments"]:
+            pay[p["method"]] = pay.get(p["method"], 0) + p["amount"]
         typ[b["type"]] = typ.get(b["type"], 0) + b["total"]
         for l in b["lines"]:
             qty, amt = items.get(l["name"], (0, 0))
             items[l["name"]] = (qty + l["qty"], amt + l["qty"] * l["price"])
+    refunds = [dict(r) for r in con.execute("SELECT * FROM refunds WHERE day = ? ORDER BY id", (day,))]
+    for r in refunds:  # by payment = what should be in the drawer / bank after refunds
+        pay[r["method"]] = pay.get(r["method"], 0) - r["amount"]
+    sums = {k: sum(b[k] for b in bills) for k in ("subtotal", "discount", "cgst", "sgst", "round_off", "total")}
+    refunded = sum(r["amount"] for r in refunds)
+    voided = [b for b in every if b.get("voided")]
     return {"day": day, "open": day == business_day(con), "count": len(bills),
-            "sums": {k: sum(b[k] for b in bills) for k in ("subtotal", "discount", "cgst", "sgst", "round_off", "total")},
+            "sums": sums, "refunds": refunded, "net": sums["total"] - refunded,
+            "voided": {"count": len(voided), "total": sum(b["total"] for b in voided)},
             "by_payment": pay, "by_type": typ,
             "items": sorted(([n, q, a] for n, (q, a) in items.items()), key=lambda x: -x[2]),
             "cancelled": con.execute("SELECT COUNT(*) FROM orders WHERE status = 'cancelled' "
                                      "AND COALESCE(day, substr(created, 1, 10)) = ?", (day,)).fetchone()[0],
-            "bills": bills}
+            "bills": every}
+
+
+def audit_log(con, q):
+    day = q.get("day", [business_day(con)])[0]
+    return [dict(r) for r in con.execute("SELECT * FROM audit WHERE day = ? ORDER BY id DESC", (day,))]
+
+
+def dashboard(con, q):
+    """Owner's overview: today, top items, busy hours, payment mix (over a period) and this week vs last week."""
+    today = date.fromisoformat(business_day(con))
+    days = {"today": 1, "7": 7, "30": 30}.get(q.get("period", ["7"])[0], 7)
+    start = (today - timedelta(days=days - 1)).isoformat()
+    live = "status = 'billed' AND voided IS NULL"
+
+    def daily(a, b):  # {day: net sales} for business days a..b, refunds taken off the day they were given
+        out = {r[0]: r[1] for r in con.execute(f"SELECT day, SUM(total) FROM orders WHERE {live} AND day BETWEEN ? AND ? "
+                                               "GROUP BY day", (a, b))}
+        for d, amt in con.execute("SELECT day, SUM(amount) FROM refunds WHERE day BETWEEN ? AND ? GROUP BY day", (a, b)):
+            out[d] = out.get(d, 0) - amt
+        return out
+
+    t = today.isoformat()
+    tb = con.execute(f"SELECT COUNT(*), COALESCE(SUM(total), 0) FROM orders WHERE {live} AND day = ?", (t,)).fetchone()
+    net_today = daily(t, t).get(t, 0)
+    items = [list(r) for r in con.execute(
+        f"SELECT l.name, SUM(l.qty), SUM(l.qty * l.price) FROM lines l JOIN orders o ON o.id = l.order_id "
+        f"WHERE o.{live.replace(' AND ', ' AND o.')} AND o.day BETWEEN ? AND ? GROUP BY l.name "
+        "ORDER BY SUM(l.qty) DESC, SUM(l.qty * l.price) DESC LIMIT 10", (start, t))]
+    hours = {r[0]: {"bills": r[1], "sales": r[2]} for r in con.execute(
+        f"SELECT CAST(substr(billed, 12, 2) AS INTEGER), COUNT(*), SUM(total) FROM orders WHERE {live} "
+        "AND day BETWEEN ? AND ? GROUP BY 1", (start, t))}
+    pay = {}
+    for m, a in con.execute(f"SELECT p.method, SUM(p.amount) FROM payments p JOIN orders o ON o.id = p.order_id "
+                            f"WHERE o.{live.replace(' AND ', ' AND o.')} AND o.day BETWEEN ? AND ? GROUP BY 1", (start, t)):
+        pay[m] = pay.get(m, 0) + a
+    for m, a in con.execute("SELECT method, SUM(amount) FROM refunds WHERE day BETWEEN ? AND ? GROUP BY 1", (start, t)):
+        pay[m] = pay.get(m, 0) - a
+    mon = today - timedelta(days=today.weekday())
+    this_w = daily(mon.isoformat(), (mon + timedelta(days=6)).isoformat())
+    last_w = daily((mon - timedelta(days=7)).isoformat(), (mon - timedelta(days=1)).isoformat())
+    week = [{"day": (mon + timedelta(days=i)).isoformat(),
+             "this": this_w.get((mon + timedelta(days=i)).isoformat(), 0) if mon + timedelta(days=i) <= today else None,
+             "last": last_w.get((mon + timedelta(days=i - 7)).isoformat(), 0)} for i in range(7)]
+    return {"day": t, "period": days, "today": {"bills": tb[0], "net": net_today, "avg": tb[1] // tb[0] if tb[0] else 0},
+            "top_items": items, "hours": hours, "payments": pay, "week": week,
+            "week_so_far": sum(w["this"] or 0 for w in week),
+            "last_week_same_days": sum(w["last"] for w in week if w["this"] is not None),
+            "last_week_total": sum(w["last"] for w in week)}
 
 
 # ---- POST routes (con, body) ----
@@ -181,14 +305,15 @@ def save_item(con, d):
         con.execute("UPDATE items SET name = ?, category = ?, price = ? WHERE id = ?", (name, cat, price, int(d["iid"])))
     else:
         con.execute("INSERT INTO items(name, category, price) VALUES(?, ?, ?)", (name, cat, price))
-    log.info("Menu: saved %s (%s) at %s", name, cat, rs(price))
+    audit(con, d, "menu_save", amount=price, detail=f"{name} ({cat})" + (" - changed" if d.get("iid") else " - added"))
     return {"ok": True}
 
 
 def delete_item(con, d):
     # ponytail: soft delete; past bills keep their own name/price snapshot anyway
+    r = con.execute("SELECT name, price FROM items WHERE id = ?", (int(d["id"]),)).fetchone()
     con.execute("UPDATE items SET active = 0 WHERE id = ?", (int(d["id"]),))
-    log.info("Menu: deleted item #%s", d["id"])
+    audit(con, d, "menu_delete", amount=r and r["price"], detail=r and r["name"])
     return {"ok": True}
 
 
@@ -197,16 +322,26 @@ def save_settings(con, d):
         check_pct(d["tax_pct"])
     if "tables" in d and not 1 <= int(d["tables"]) <= 50:
         raise ValueError("tables must be 1-50")
-    if d.get("pin") and not (str(d["pin"]).isdigit() and len(str(d["pin"])) >= 6):
-        raise ValueError("PIN must be 6+ digits")
+    for k in SECRET_SETTINGS:
+        if d.get(k) and not (str(d[k]).isdigit() and len(str(d[k])) >= 6):
+            raise ValueError("PIN must be 6+ digits")
+    old = settings(con)
+    staff, owner = str(d.get("pin") or old["pin"]), str(d.get("owner_pin") or old.get("owner_pin") or "")
+    if owner and owner == staff:
+        raise ValueError("the owner PIN must be different from the staff PIN")
     if d.get("printer") and not PORT_RE.fullmatch(str(d["printer"])):  # only COM ports, never a file path
         raise ValueError("printer must be a COM port like COM5")
     if "paper" in d and d["paper"] not in ("58", "80"):
         raise ValueError("paper must be 58 or 80 mm")
+    changed = []
     for k in DEFAULT_SETTINGS:
-        if k in d and not (k == "pin" and not d[k]):  # blank PIN field = keep current
-            con.execute("UPDATE settings SET value = ? WHERE key = ?", (str(d[k]).strip(), k))
-    log.info("Settings saved%s", " (PIN changed)" if d.get("pin") else "")
+        if k in d and not (k in SECRET_SETTINGS and not d[k]):  # blank PIN field = keep current
+            v = str(d[k]).strip()
+            if v != (old.get(k) or ""):
+                changed.append(k)
+            con.execute("UPDATE settings SET value = ? WHERE key = ?", (v, k))
+    if changed:  # names only - PINs are never written to the log
+        audit(con, d, "settings", detail=", ".join(changed))
     return {"ok": True}
 
 
@@ -228,8 +363,22 @@ def new_order(con, d):
 
 
 def send_kot(con, d):
-    oid = int(d["order_id"])
-    if not con.execute("SELECT 1 FROM orders WHERE id = ? AND status = 'open'", (oid,)).fetchone():
+    """Send items to the kitchen. With `order` (and no open order_id) the order is found or created here, so a tablet
+    that was offline can resend safely: same client_id = same KOT, and a table that got an order meanwhile is joined."""
+    cid = str(d.get("client_id") or "")[:64] or None
+    if cid:
+        r = con.execute("SELECT id, order_id FROM kots WHERE client_id = ?", (cid,)).fetchone()
+        if r:
+            return {"id": r["id"], "order_id": r["order_id"], "duplicate": True}
+    oid = int(d["order_id"]) if d.get("order_id") else None
+    if oid and d.get("order") and not con.execute("SELECT 1 FROM orders WHERE id = ? AND status = 'open'", (oid,)).fetchone():
+        oid = None  # billed/cancelled while this tablet was offline: start again from the draft
+    if not oid and d.get("order"):
+        o = d["order"]
+        ex = o.get("type") == "dine_in" and con.execute(
+            "SELECT id FROM orders WHERE status = 'open' AND type = 'dine_in' AND table_no = ?", (int(o["table_no"]),)).fetchone()
+        oid = ex["id"] if ex else new_order(con, o)["id"]
+    if not oid or not con.execute("SELECT 1 FROM orders WHERE id = ? AND status = 'open'", (oid,)).fetchone():
         raise ValueError("order is not open")
     lines = []
     for l in d.get("lines") or []:
@@ -248,29 +397,35 @@ def send_kot(con, d):
         lines.append((r["id"], r["name"], r["price"], qty))
     if not lines:
         raise ValueError("no items")
-    kid = con.execute("INSERT INTO kots(order_id, created, note) VALUES(?, ?, ?)",
-                      (oid, now(), str(d.get("note") or "").strip()[:200])).lastrowid
+    kid = con.execute("INSERT INTO kots(order_id, created, note, client_id) VALUES(?, ?, ?, ?)",
+                      (oid, now(), str(d.get("note") or "").strip()[:200], cid)).lastrowid
     con.executemany("INSERT INTO lines(order_id, kot_id, item_id, name, price, qty) VALUES(?, ?, ?, ?, ?, ?)",
                     [(oid, kid, *l) for l in lines])
     log.info("KOT %s -> kitchen for order #%s: %s", kid, oid,
              ", ".join(f"{q}x {n}" + ("" if i else f" (custom, {rs(p)})") for i, n, p, q in lines))
-    return {"id": kid}
+    return {"id": kid, "order_id": oid}
 
 
 def remove_line(con, d):
-    # ponytail: no audit trail for removed items; add a voids table if staff misuse becomes a worry
-    if not con.execute("DELETE FROM lines WHERE id = ? AND order_id IN (SELECT id FROM orders WHERE status = 'open')",
-                       (int(d["line_id"]),)).rowcount:
+    """Take an item that was already sent to the kitchen off an open order (a void): owner PIN + reason, logged."""
+    reason = need_reason(d)
+    l = con.execute("SELECT l.* FROM lines l JOIN orders o ON o.id = l.order_id WHERE l.id = ? AND o.status = 'open'",
+                    (int(d["line_id"]),)).fetchone()
+    if not l:
         raise ValueError("item not found or order already billed")
-    log.info("Item removed from an open order (line #%s)", d["line_id"])
+    con.execute("DELETE FROM lines WHERE id = ?", (l["id"],))
+    audit(con, d, "remove_item", l["order_id"], l["price"] * l["qty"], reason, f"{l['qty']} x {l['name']}")
     return {"ok": True}
 
 
 def cancel_order(con, d):
-    if not con.execute("UPDATE orders SET status = 'cancelled', day = ? WHERE id = ? AND status = 'open'",
-                       (business_day(con), int(d["order_id"]))).rowcount:
+    reason = need_reason(d)
+    o = get_order(con, int(d["order_id"])) if con.execute("SELECT 1 FROM orders WHERE id = ?", (int(d["order_id"]),)).fetchone() else None
+    if not o or not con.execute("UPDATE orders SET status = 'cancelled', day = ? WHERE id = ? AND status = 'open'",
+                                (business_day(con), o["id"])).rowcount:
         raise ValueError("order is not open")
-    log.warning("Order #%s CANCELLED", d["order_id"])
+    audit(con, d, "cancel_order", o["id"], o["amount"], reason,
+          ", ".join(f"{l['qty']} x {l['name']}" for l in o["lines"]) or "no items")
     return {"ok": True}
 
 
@@ -280,20 +435,58 @@ def kot_ready(con, d):
     return {"ok": True}
 
 
+def parse_payments(d, total):
+    """[(method, paise)] adding up to the bill. One `payment` = the whole bill; `payments` = split
+    (e.g. Cash 500 + UPI the rest, or one row per person when a table splits the bill)."""
+    if not d.get("payments"):
+        if d.get("payment") not in PAYMENTS:
+            raise ValueError("pick a payment mode")
+        return [(d["payment"], total)] if total else []
+    out = []
+    for p in d["payments"][:20]:
+        m, a = p.get("method"), paise(p.get("amount") or 0)
+        if m not in PAYMENTS or a <= 0:
+            raise ValueError("each payment needs a mode and an amount above 0")
+        out.append((m, a))
+    if sum(a for _, a in out) != total:
+        raise ValueError(f"payments add up to {rs(sum(a for _, a in out))} but the bill is {rs(total)}")
+    return out
+
+
 def bill_order(con, d):
-    oid, payment = int(d["order_id"]), d.get("payment")
-    if payment not in PAYMENTS:
-        raise ValueError("pick a payment mode")
-    lines = [(r["price"], r["qty"]) for r in con.execute("SELECT price, qty FROM lines WHERE order_id = ?", (oid,))]
-    if not lines:
+    """Bill an order. `line_ids` bills only those items (split by items): they move to their own bill and the
+    rest stays open on the table. Discounts need the owner PIN and are logged."""
+    oid = int(d["order_id"])
+    o = con.execute("SELECT * FROM orders WHERE id = ? AND status = 'open'", (oid,)).fetchone()
+    if not o:
+        raise ValueError("order is not open")
+    all_ids = [r[0] for r in con.execute("SELECT id FROM lines WHERE order_id = ?", (oid,))]
+    if not all_ids:
         raise ValueError("order has no items")
+    pick = sorted({int(x) for x in d.get("line_ids") or []})
+    if pick and not set(pick) <= set(all_ids):
+        raise ValueError("some items are not on this order any more - refresh")
+    split = bool(pick) and len(pick) < len(all_ids)
+    ids = pick if split else all_ids
+    lines = [(r["price"], r["qty"]) for r in con.execute(
+        f"SELECT price, qty FROM lines WHERE id IN ({','.join('?' * len(ids))})", ids)]
     tax_pct, disc = settings(con)["tax_pct"], check_pct(d.get("discount_pct"))
     amt = paise(d.get("discount_amt") or 0)  # flat ₹ discount; when used, discount_pct stays "0"
     if amt:
         disc = "0"
         if not 0 < amt <= sum(p * q for p, q in lines):
             raise ValueError("rupee discount must be more than 0 and not more than the bill")
+    if amt or Decimal(disc):
+        need_owner(d, "A discount")
     sub, dis, cgst, sgst, ro, total = totals(lines, disc, tax_pct, amt)
+    pays = parse_payments(d, total)
+    payment = "+".join(dict.fromkeys(m for m, _ in pays)) or "Cash"  # "Cash", or "Cash+UPI" for a split
+    if split:  # everything checked - the part being paid becomes its own order (table_no NULL for a moment)
+        part = con.execute("INSERT INTO orders(type, table_no, customer, phone, address, created) VALUES(?, NULL, ?, ?, ?, ?)",
+                           (o["type"], o["customer"], o["phone"], o["address"], o["created"])).lastrowid
+        con.execute(f"UPDATE lines SET order_id = ? WHERE id IN ({','.join('?' * len(pick))})", (part, *pick))
+        log.info("Split bill: %d of %d items of order #%s billed separately as #%s", len(pick), len(all_ids), oid, part)
+        oid = part
     t, day = now(), business_day(con)
     # numbers assigned inside the UPDATE so two tablets billing at once can't get the same one;
     # bill_no = lifetime sequence (internal), day_no = 1, 2, 3... restarting every business day
@@ -304,9 +497,57 @@ def bill_order(con, d):
             "cgst = ?, sgst = ?, round_off = ?, total = ? WHERE id = ? AND status = 'open'",
             (day, t, day, payment, sub, disc, dis, tax_pct, cgst, sgst, ro, total, oid)).rowcount:
         raise ValueError("order is not open")
+    con.execute("UPDATE orders SET table_no = ? WHERE id = ?", (o["table_no"], oid))  # split part: back on its table
+    con.executemany("INSERT INTO payments(order_id, method, amount) VALUES(?, ?, ?)", [(oid, m, a) for m, a in pays])
     b = get_order(con, oid)
-    log.info("BILL %s: %s paid by %s (order #%s)", b["bill_label"], rs(total), payment, oid)
+    if dis:
+        audit(con, d, "discount", oid, dis, d.get("reason") or None,
+              f"bill {b['bill_label']}: " + (f"{disc}% off" if Decimal(disc) else f"{rs(dis)} off") + f" {rs(sub)}")
+    log.info("BILL %s: %s paid by %s (order #%s)", b["bill_label"], rs(total),
+             " + ".join(f"{m} {rs(a)}" for m, a in pays) or "-", oid)
     return b
+
+
+def void_bill(con, d):
+    """Cancel a printed bill (wrong items, wrong table...). It keeps its number for GST but leaves the totals.
+    With reopen, the same items come back as an open order to correct and bill again."""
+    reason = need_reason(d)
+    r = con.execute("SELECT * FROM orders WHERE id = ? AND status = 'billed' AND voided IS NULL", (int(d["order_id"]),)).fetchone()
+    if not r:
+        raise ValueError("bill not found or already voided")
+    b = order_out(con, r)
+    if b["refunded"]:
+        raise ValueError("this bill already has a refund - it can't be voided")
+    con.execute("UPDATE orders SET voided = ?, void_reason = ? WHERE id = ?", (now(), reason, r["id"]))
+    new = None
+    if d.get("reopen"):  # table already has another open order -> IntegrityError, and nothing is changed
+        new = con.execute("INSERT INTO orders(type, table_no, customer, phone, address, created) VALUES(?, ?, ?, ?, ?, ?)",
+                          (r["type"], r["table_no"], r["customer"], r["phone"], r["address"], now())).lastrowid
+        kid = con.execute("INSERT INTO kots(order_id, created, note, status) VALUES(?, ?, ?, 'ready')",
+                          (new, now(), f"Reopened from bill {b['bill_label']}")).lastrowid  # not sent to the kitchen again
+        con.executemany("INSERT INTO lines(order_id, kot_id, item_id, name, price, qty) SELECT ?, ?, item_id, name, price, qty "
+                        "FROM lines WHERE order_id = ? AND id = ?", [(new, kid, r["id"], l["id"]) for l in b["lines"]])
+    audit(con, d, "void_bill", r["id"], r["total"], reason,
+          f"bill {b['bill_label']}" + (f", reopened as order #{new}" if new else ""))
+    return {"ok": True, "reopened": new}
+
+
+def refund_bill(con, d):
+    """Give money back on a bill (full or part). Counted on today's business day, by payment mode."""
+    reason, amount, method = need_reason(d), paise(d.get("amount") or 0), d.get("method")
+    if method not in PAYMENTS:
+        raise ValueError("pick how the money is given back")
+    r = con.execute("SELECT * FROM orders WHERE id = ? AND status = 'billed' AND voided IS NULL", (int(d["order_id"]),)).fetchone()
+    if not r:
+        raise ValueError("bill not found or voided")
+    left = r["total"] - con.execute("SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE order_id = ?", (r["id"],)).fetchone()[0]
+    if not 0 < amount <= left:
+        raise ValueError(f"refund must be more than 0 and at most {rs(left)}")
+    con.execute("INSERT INTO refunds(order_id, at, day, amount, method, reason) VALUES(?, ?, ?, ?, ?, ?)",
+                (r["id"], now(), business_day(con), amount, method, reason))
+    audit(con, d, "refund", r["id"], amount, reason,
+          f"bill {bill_label(r['day'], r['day_no']) if r['day_no'] else r['bill_no']}, by {method}")
+    return {"ok": True}
 
 
 def close_day(con, d):
@@ -322,7 +563,8 @@ def close_day(con, d):
     if not con.execute("UPDATE settings SET value = ? WHERE key = 'business_day' AND value = ?", (nxt, day)).rowcount:
         raise ValueError("this day is already closed - refresh the page")
     r = report(con, {"day": [day]})
-    log.info("DAY CLOSED %s: %d bills, net %s. Next business day: %s", day, r["count"], rs(r["sums"]["total"]), nxt)
+    audit(con, d, "close_day", amount=r["net"], detail=f"{day}: {r['count']} bills, next day {nxt}", day=day)
+    log.info("DAY CLOSED %s: %d bills, net %s. Next business day: %s", day, r["count"], rs(r["net"]), nxt)
     return {"report": r, "next": nxt}
 
 
@@ -443,7 +685,10 @@ def header(t, s):
 
 
 def bill_ticket(b, s, w):
-    t = header(Ticket(w), s).line("TAX INVOICE", bold=True, center=True).rule()
+    t = header(Ticket(w), s).line("TAX INVOICE", bold=True, center=True)
+    if b.get("voided"):
+        t.line("*** VOID - NOT PAYABLE ***", bold=True, center=True)
+    t.rule()
     t.row("Bill No:", b["bill_label"]).row("Date:", datetime.fromisoformat(b["billed"]).strftime("%d/%m/%y %I:%M %p"))
     t.row({"dine_in": f"Dine-in, Table {b['table_no']}", "takeaway": "Takeaway", "delivery": "Delivery"}[b["type"]],
           "Paid: " + b["payment"])
@@ -462,6 +707,10 @@ def bill_ticket(b, s, w):
     if b["round_off"]:
         t.row("Round off", amt(b["round_off"]))
     t.rule().row("TOTAL Rs.", amt(b["total"]), bold=True).rule()
+    if len(b.get("payments") or []) > 1:  # split payment: show each part
+        for p in b["payments"]:
+            t.row(f"  Paid {p['method']}", amt(p["amount"]))
+        t.rule()
     if s.get("footer"):
         t.line(s["footer"], center=True)
     return t.end(cut=w >= 48)
@@ -475,7 +724,11 @@ def day_ticket(r, s, w):
     t.rule().row("Bills", r["count"]).row("Cancelled orders", r["cancelled"]).rule()
     t.row("Gross", amt(sm["subtotal"])).row("Discounts", amt(-sm["discount"]))
     t.row(f"CGST @ {h}%", amt(sm["cgst"])).row(f"SGST @ {h}%", amt(sm["sgst"])).row("Round off", amt(sm["round_off"]))
-    t.rule().row("NET SALES Rs.", amt(sm["total"]), bold=True).rule().line("By payment", bold=True)
+    if r.get("voided", {}).get("count"):
+        t.row(f"Voided bills ({r['voided']['count']})", amt(r["voided"]["total"]))
+    if r.get("refunds"):
+        t.row("Bills total", amt(sm["total"])).row("Refunds", amt(-r["refunds"]))
+    t.rule().row("NET SALES Rs.", amt(r.get("net", sm["total"])), bold=True).rule().line("By payment", bold=True)
     for k, v in r["by_payment"].items():
         t.row(k, amt(v))
     t.rule().line("By order type", bold=True)
@@ -520,6 +773,7 @@ def print_job(con, d):
         b = order_out(con, r)
         data, what = bill_ticket(b, s, w), f"bill {b['bill_label']}"
     elif d.get("day"):
+        need_owner(d, "The day report")
         data, what = day_ticket(report(con, {"day": [str(d["day"])]}), s, w), f"day report {d['day']}"
     elif d.get("test"):
         t = header(Ticket(w), s).line("Printer test", bold=True, center=True).rule()
@@ -534,11 +788,15 @@ def print_job(con, d):
 
 
 GET = {"/api/state": state, "/api/kitchen": kitchen, "/api/report": report, "/api/backup": backup,
-       "/api/printers": printer_ports}
+       "/api/printers": printer_ports, "/api/audit": audit_log, "/api/dashboard": dashboard}
 POST = {"/api/items": save_item, "/api/items/delete": delete_item, "/api/settings": save_settings,
         "/api/orders/new": new_order, "/api/orders/kot": send_kot, "/api/orders/remove_line": remove_line,
         "/api/orders/cancel": cancel_order, "/api/orders/bill": bill_order, "/api/kots/ready": kot_ready,
-        "/api/day/close": close_day, "/api/print": print_job}
+        "/api/day/close": close_day, "/api/print": print_job, "/api/bills/void": void_bill, "/api/bills/refund": refund_bill}
+# staff take orders, bill and run the kitchen; everything else needs the owner PIN (discounts: checked in bill_order)
+OWNER_ONLY = {"/api/report", "/api/backup", "/api/printers", "/api/audit", "/api/dashboard", "/api/items",
+              "/api/items/delete", "/api/settings", "/api/orders/remove_line", "/api/orders/cancel", "/api/day/close",
+              "/api/bills/void", "/api/bills/refund"}
 
 
 # ponytail: one global lockout, so guessing a 6-digit PIN online takes months; an attacker can also keep
@@ -572,6 +830,8 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
         except ValueError:
             return self.send({"error": "bad request"}, 400)
+        if not isinstance(data, dict):
+            return self.send({"error": "bad request"}, 400)
         self.api(POST.get(self.path), data)
 
     def api(self, route, arg):
@@ -581,7 +841,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send({"error": "Too many wrong PINs. Wait a minute and try again."}, 429)
         con = db()
         try:
-            if not hmac.compare_digest(self.headers.get("X-Pin", "").encode(), settings(con)["pin"].encode()):
+            role = role_for(settings(con), self.headers.get("X-Pin", ""))
+            if not role:
                 LOCK["fails"] += 1
                 if self.headers.get("X-Pin"):  # a blank PIN is just a tablet's first visit
                     # behind Tailscale Funnel every visitor is 127.0.0.1; the proxy passes the real one along
@@ -592,9 +853,17 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(1)
                 return self.send({"error": "Wrong PIN"}, 401)
             LOCK["fails"] = 0
+            path = urlparse(self.path).path
+            if path in OWNER_ONLY and role != "owner":
+                return self.send({"error": "Only the owner can do this - ask the owner to enter the owner PIN.",
+                                  "owner": True}, 403)
+            arg["_who"] = {"role": role, "device": self.headers.get("X-Device", "")[:40] or None,
+                           "ip": (self.headers.get("X-Forwarded-For") or self.client_address[0])[:60]}
             with con:  # one transaction per request, rolled back on any error
                 out = route(con, arg)
             self.send(out, ctype="application/octet-stream" if isinstance(out, bytes) else "application/json")
+        except Forbidden as e:
+            self.send({"error": f"{e} - ask the owner to enter it.", "owner": True}, 403)
         except PrinterError as e:
             log.error("Print failed: %s", e)
             self.send({"error": str(e)}, 503)
@@ -671,7 +940,12 @@ def selftest():
         assert [l["name"] for l in b2["lines"]] == ["Paneer Tikka", "Birthday Cake"]
         assert (b2["subtotal"], b2["discount"], b2["discount_pct"]) == (24950 + 35000, 5000, "0")
         o2 = new_order(con, {"type": "takeaway"})["id"]
-        cancel_order(con, {"order_id": o2})
+        try:
+            cancel_order(con, {"order_id": o2})
+            raise AssertionError("cancelled without a reason")
+        except ValueError:
+            pass
+        cancel_order(con, {"order_id": o2, "reason": "customer left"})
         closed = close_day(con, {"day": b["day"]})
         assert closed["report"]["count"] == 2 and closed["report"]["cancelled"] == 1
         assert business_day(con) == closed["next"] == (date.today() + timedelta(days=1)).isoformat()
@@ -702,9 +976,91 @@ def selftest():
             raise AssertionError(f"accepted printer {bad!r}")
         except ValueError:
             pass
+    # ---- v3: owner/staff PINs, audit trail, split bills & payments, voids, refunds, offline resends, dashboard ----
+    staff, owner = {"_who": {"role": "staff", "device": "T1"}}, {"_who": {"role": "owner", "device": "Counter"}}
+    with con:
+        save_settings(con, {**owner, "owner_pin": "987654"})
+        s = settings(con)
+        assert role_for(s, "987654") == "owner" and role_for(s, "1234") == "staff" and role_for(s, "1") is None
+        assert role_for({"pin": "1234", "owner_pin": ""}, "1234") == "owner"  # no owner PIN yet: works as before
+        try:
+            save_settings(con, {"pin": "555555", "owner_pin": "555555"})
+            raise AssertionError("owner PIN same as staff PIN")
+        except ValueError:
+            pass
+        assert "owner_pin" not in state(con, staff)["settings"] and state(con, staff)["role"] == "staff"
+        # offline resend: the same client_id twice makes one KOT; a draft for a busy table joins its order
+        k1 = send_kot(con, {**staff, "client_id": "tab1-1", "order": {"type": "dine_in", "table_no": 2},
+                            "lines": [{"id": pid, "qty": 3}]})
+        again = send_kot(con, {**staff, "client_id": "tab1-1", "order": {"type": "dine_in", "table_no": 2},
+                               "lines": [{"id": pid, "qty": 3}]})
+        assert again["duplicate"] and again["id"] == k1["id"]
+        k2 = send_kot(con, {**staff, "client_id": "tab2-1", "order": {"type": "dine_in", "table_no": 2},
+                            "lines": [{"name": "Water", "price": "20", "qty": 3}]})
+        oid4 = k2["order_id"]
+        assert oid4 == k1["order_id"] and len(get_order(con, oid4)["lines"]) == 2
+        try:
+            bill_order(con, {**staff, "order_id": oid4, "payment": "Cash", "discount_pct": 10})
+            raise AssertionError("staff gave a discount")
+        except Forbidden:
+            pass
+        # split by items + split payment: Paneer paid now (Cash 500 + UPI rest), Water stays on table 2
+        paneer = [l["id"] for l in get_order(con, oid4)["lines"] if l["name"] == "Paneer Tikka"]
+        try:
+            bill_order(con, {**staff, "order_id": oid4, "line_ids": paneer, "payments": [{"method": "Cash", "amount": "1"}]})
+            raise AssertionError("payments don't add up")
+        except ValueError:
+            pass
+        part = bill_order(con, {**staff, "order_id": oid4, "line_ids": paneer,
+                                "payments": [{"method": "Cash", "amount": "500"}, {"method": "UPI", "amount": "286"}]})
+        assert part["total"] == 78600 and part["table_no"] == 2 and part["payment"] == "Cash+UPI"
+        assert part["payments"] == [{"method": "Cash", "amount": 50000}, {"method": "UPI", "amount": 28600}]
+        rest = get_order(con, oid4)
+        assert rest["status"] == "open" and [l["name"] for l in rest["lines"]] == ["Water"]
+        tk = re.sub(rb"\x1b[aE@d].?|\x1d[!V].?", b"", bill_ticket(part, settings(con), 32)).decode()
+        assert "Paid Cash" in tk and "Paid UPI" in tk
+        # the rest split equally between 3 people
+        w = bill_order(con, {**staff, "order_id": oid4, "payments": [{"method": "UPI", "amount": "21"}] * 3})
+        assert w["total"] == 6300 and len(w["payments"]) == 3
+        k3 = send_kot(con, {**staff, "order": {"type": "takeaway"}, "lines": [{"id": pid, "qty": 1}]})
+        bill_order(con, {**owner, "order_id": k3["order_id"], "payment": "Card", "discount_pct": 10})
+        # void a bill and reopen it to correct; voided bills leave the totals; refunds need a reason
+        try:
+            void_bill(con, {**owner, "order_id": w["id"]})
+            raise AssertionError("void without a reason")
+        except ValueError:
+            pass
+        v = void_bill(con, {**owner, "order_id": w["id"], "reason": "wrong table", "reopen": True})
+        ro_ = get_order(con, v["reopened"])
+        assert ro_["status"] == "open" and ro_["table_no"] == 2 and [(l["name"], l["qty"]) for l in ro_["lines"]] == [("Water", 3)]
+        assert not any("Reopened" in (k["note"] or "") for k in kitchen(con, {}))  # not cooked twice
+        assert "VOID" in bill_ticket(get_order(con, w["id"]), settings(con), 32).decode("ascii", "ignore")
+        try:
+            void_bill(con, {**owner, "order_id": w["id"], "reason": "again"})
+            raise AssertionError("voided twice")
+        except ValueError:
+            pass
+        remove_line(con, {**owner, "line_id": ro_["lines"][0]["id"], "reason": "not wanted"})
+        refund_bill(con, {**owner, "order_id": part["id"], "amount": "100", "method": "Cash", "reason": "cold food"})
+        try:
+            refund_bill(con, {**owner, "order_id": part["id"], "amount": "700", "method": "Cash", "reason": "too much"})
+            raise AssertionError("refunded more than the bill")
+        except ValueError:
+            pass
+        r = report(con, {"day": [business_day(con)]})
+        assert r["voided"] == {"count": 1, "total": 6300} and r["refunds"] == 10000 and r["net"] == r["sums"]["total"] - 10000
+        assert r["by_payment"]["UPI"] == 28600  # the voided bill's UPI is not counted
+        acts = {a["action"] for a in audit_log(con, {})}
+        assert {"settings", "discount", "void_bill", "refund", "remove_item"} <= acts, acts
+        assert all(a["role"] for a in audit_log(con, {}))
+        dsh = dashboard(con, {"period": ["today"]})
+        assert dsh["payments"] == r["by_payment"] and dsh["today"]["net"] == r["net"] and dsh["today"]["bills"] == r["count"]
+        assert dsh["top_items"][0][0] == "Paneer Tikka" and len(dsh["week"]) == 7 and dsh["hours"]
+        assert b"Refunds" in day_ticket(r, settings(con), 32)
     snap = sqlite3.connect(":memory:")
-    snap.deserialize(backup(con, {}))
-    assert snap.execute("SELECT total FROM orders WHERE status = 'billed'").fetchone()[0] == 52400  # backup holds the bill
+    if hasattr(snap, "deserialize"):  # Python 3.11+
+        snap.deserialize(backup(con, {}))
+        assert snap.execute("SELECT total FROM orders WHERE status = 'billed' ORDER BY id").fetchone()[0] == 52400  # backup holds the bill
     print("ok")
 
 

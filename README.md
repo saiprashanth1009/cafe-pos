@@ -43,13 +43,20 @@ Back up data: in the app, **Settings → Download backup of all data**, at least
 | Kitchen | Kitchen tablet | Live list of KOTs (refreshes every 5 s). A ticket turns red after 15 min. Tap **Mark ready**. |
 | Bill & print | Counter | Pick Cash / UPI / Card, set an optional discount %, and print. GST is split into CGST + SGST and the total is rounded to the nearest ₹1. |
 | Close day | Owner, at closing time | Reports → **Close day & print report**. Bills keep going to the same business day (even after midnight or after restarting the app) until you press this. It prints the daily report and moves billing to the next day. It's blocked while any order is still open. |
-| Printer on a phone | Owner, once per phone | Android only. Install **RawBT** from the Play Store, pair the printer (e.g. EZO, 58 mm) inside RawBT and print its test page. In the POS on that phone: **Settings → tick "Print from this phone"**, **Paper width** = 58 mm, **Print a test page**. Bills and day reports then open RawBT and print. iPhones can't do this. |
+| Printer on a phone | Owner, once per phone | Android only. Install **RawBT** from the Play Store, pair the printer (e.g. EZO, 58 mm) inside RawBT and print its test page. In the POS on that phone: **⚙ (top right) → tick "Print from this phone"**, then **Print a test page**. Paper width is in Settings. Bills and day reports then open RawBT and print. iPhones can't do this. |
 | Printer on the counter PC | Owner, once | Pair the Bluetooth receipt printer (e.g. EZO Chota, 58 mm) with the counter PC in Windows Bluetooth settings. Then **Settings → Receipt printer** = its COM port, **Paper width** = 58 mm, Save, and **Print a test page**. Bills and day reports then print straight away from any tablet. |
 | Custom item | Waiters / counter | On the order screen, **+ Custom item**: type a name and price for a one-off dish. It goes to the kitchen, the bill and the receipt, but is never added to the menu. |
-| Discounts | Counter | In the bill box, choose **%** or **₹**. GST is charged on the amount after the discount. |
+| Discounts | Counter + owner | In the bill box, choose **%** or **₹**. GST is charged on the amount after the discount. On a staff tablet the owner types the owner PIN and a reason. |
+| Owner and staff PINs | Owner, once | **Settings → owner PIN**. The old PIN becomes the **staff PIN**: staff take orders, bill and run the kitchen. Only the owner PIN opens Dashboard, Reports, Menu and Settings, and approves discounts, cancels, removed items, voids, refunds and Close day. Until an owner PIN is set, the one PIN does everything (as before). On any tablet, **⚙ → Owner: unlock this tablet** / **Lock to staff mode**. |
+| Split bill | Counter | In the bill box: **Split by items** (tick what this person pays; the rest stays on the table), **+ Split payment** (e.g. ₹500 cash, the rest fills in as UPI), or **÷2 / ÷3 / ÷4** (one bill, equal shares, each with its own payment mode). |
+| Void / refund | Owner | Reports → **Void** (keeps the bill number for GST, leaves the totals, prints as VOID; can reopen the items to correct and bill again) or **Refund** (full or part, by Cash/UPI/Card). Both need a reason. |
+| Audit log | Owner | Reports → **Audit log**: every cancelled order, removed item, discount, void, refund, menu/settings change and day close, with the time, owner/staff, the tablet's name (⚙ → Tablet name) and the reason. |
+| Offline tablets | - | If Wi-Fi drops, **Send to kitchen** still works: the KOT waits on the tablet (a red bar says so, even after a reload) and goes to the kitchen by itself when the connection is back, never twice. Billing needs the connection. |
+| Dashboard | Owner | Today's sales, bills and average bill; this week vs last week by day; top items, busiest hours and Cash vs UPI vs Card for today / 7 / 30 days. |
+| Start with Windows | Owner, once | In the CafePOS window tick **Start with Windows**: the POS opens by itself when the laptop restarts and signs in. |
 | Bill numbers | - | Restart at 1 every business day. The printed invoice number carries the date (e.g. `131126-1` = bill 1 on 13 Nov 2026) so it stays unique for the financial year, as GST requires. |
-| PIN prompts | - | Saving/deleting menu items, saving settings and Close day each ask for the staff PIN, so a stray tap can't change them. |
-| Reports | Owner | For any date: net sales, GST, discounts, cancelled orders, totals by payment and by order type, item-wise sales, and bill reprints. |
+| PIN prompts | - | Saving/deleting menu items, saving settings and Close day each ask for the owner PIN again, so a stray tap can't change them. |
+| Reports | Owner | For any date: net sales (after refunds), GST, discounts, cancelled orders, voided bills, refunds, totals by payment and by order type, item-wise sales, bill reprints and the audit log. |
 
 Printing uses the tablet's normal print dialog: AirPrint on iPad, the print service on Android.
 Any 80 mm thermal printer that the tablet can see works.
@@ -68,9 +75,10 @@ Any 80 mm thermal printer that the tablet can see works.
 - Daily automatic backup of `pos.db` (to a USB stick or Google Drive)
 - Bill numbers that restart each financial year (e.g. `GR/26-27/0001`)
 
+**v3: done**
+- Owner and staff PINs, void/refund with a reason, audit log, split bills and split payments, offline KOTs, dashboard, Start with Windows
+
 **Phase 3: after a few weeks of real use**
-- Void/refund of printed bills with a reason (an audit trail for the owner)
-- Separate PINs for owner and staff (staff can't edit the menu or see reports)
 - Month and GST-period reports with CSV export for your accountant
 - UPI QR code on the bill, and a packing charge for takeaway/delivery (for now, add it as a menu item)
 - Swiggy/Zomato order entry, and a customer phone book for repeat deliveries

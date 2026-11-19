@@ -85,6 +85,27 @@ dialog form{display:grid;gap:12px}
   .ticket{position:static;max-height:none}
   .cols{grid-template-columns:1fr}
 }
+.net{background:#fde8e8;border:1px solid #f0b4b4}
+nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
+.void td{color:var(--mute);text-decoration:line-through}
+.void td:last-child{text-decoration:none}
+.paylines{display:grid;gap:6px}
+.payrow{display:grid;grid-template-columns:110px 1fr 40px;gap:6px}
+.picks label{display:flex;gap:8px;align-items:center;color:var(--ink);padding:4px 0}
+.picks input{width:auto}
+/* dashboard charts: one hue (accent) for magnitude, grey for last week; values shown as text, never colour alone */
+.hb{display:grid;grid-template-columns:minmax(90px,38%) 1fr auto;gap:8px;align-items:center;padding:3px 0;font-size:14px}
+.hb .tr{height:14px}
+.hb .b{height:14px;background:var(--acc);border-radius:0 4px 4px 0;min-width:2px}
+.vb{display:flex;align-items:flex-end;gap:2px;height:150px;border-bottom:1px solid var(--line)}
+.vb .c{flex:1;display:flex;gap:2px;align-items:flex-end;height:100%;justify-content:center}
+.vb .b{flex:1;max-width:28px;background:var(--acc);border-radius:4px 4px 0 0;min-height:1px}
+.vb .b.last{background:#a8a195}
+.vb .b:hover{opacity:.8}
+.vx{display:flex;gap:2px;font-size:11px;color:var(--mute);margin-top:4px}
+.vx span{flex:1;text-align:center}
+.legend{display:flex;gap:14px;font-size:13px;color:var(--mute);margin-bottom:8px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
 #receipt{display:none}
 @media print{
   @page{margin:3mm}
@@ -103,10 +124,13 @@ dialog form{display:grid;gap:12px}
   <b id="rname">POS</b>
   <button data-view="floor">Tables</button>
   <button data-view="kitchen">Kitchen</button>
-  <button data-view="reports">Reports</button>
-  <button data-view="menu">Menu</button>
-  <button data-view="settings">Settings</button>
+  <button data-view="dash" class="own">Dashboard</button>
+  <button data-view="reports" class="own">Reports</button>
+  <button data-view="menu" class="own">Menu</button>
+  <button data-view="settings" class="own">Settings</button>
+  <button id="whoBtn" class="who" type="button"></button>
 </nav>
+<div id="netBanner" class="card net" style="margin:8px 16px 0" hidden></div>
 
 <main>
 <section id="floor">
@@ -139,6 +163,13 @@ dialog form{display:grid;gap:12px}
 
 <section id="kitchen" hidden><div id="kots" class="kots"></div></section>
 
+<section id="dash" hidden>
+  <div class="bar wrap"><div id="dPeriod" class="seg" style="grid-template-columns:repeat(3,auto)">
+    <button type="button" data-p="today">Today</button><button type="button" data-p="7">7 days</button><button type="button" data-p="30">30 days</button></div>
+    <span class="mute" style="font-size:14px">Top items, busy hours and payments cover this period.</span></div>
+  <div id="dashBody"></div>
+</section>
+
 <section id="reports" hidden>
   <div class="bar wrap"><input id="rday" type="date" style="max-width:220px"><span id="dayTag" class="tag"></span>
     <span style="flex:1"></span><button id="dayBtn" class="pri"></button></div>
@@ -170,14 +201,21 @@ dialog form{display:grid;gap:12px}
 
 <dialog id="billDlg"><form id="billForm">
   <h2 id="billTitle">Bill</h2>
-  <div id="payBtns" class="seg"></div>
-  <label>Discount</label>
+  <details id="splitBox"><summary>Split by items - pay for some items only</summary>
+    <div id="billLines" class="picks"></div>
+    <p class="mute" style="margin:4px 0 0;font-size:13px">Unticked items stay on the table for the next bill.</p></details>
+  <label>Discount <span id="discWho"></span></label>
   <div class="row" style="justify-content:flex-start;margin-top:-6px">
     <div id="discMode" class="seg" style="grid-template-columns:repeat(2,56px)"><button type="button" data-mode="%">%</button><button type="button" data-mode="₹">₹</button></div>
     <input id="bdisc" type="number" min="0" step="0.5" value="0" inputmode="decimal">
   </div>
   <div id="bsum"></div>
-  <div class="row"><button type="button" data-close>Back</button><button class="ok">Confirm &amp; print</button></div>
+  <label>Payment</label>
+  <div id="payRows" class="paylines"></div>
+  <div class="row wrap" style="justify-content:flex-start;gap:6px"><button type="button" id="addPay">+ Split payment</button>
+    <span class="mute">Split equally:</span><button type="button" data-eq="2">÷2</button><button type="button" data-eq="3">÷3</button><button type="button" data-eq="4">÷4</button></div>
+  <div id="payLeft" class="big" style="font-size:16px"></div>
+  <div class="row"><button type="button" data-close>Back</button><button class="ok" id="billOk">Confirm &amp; print</button></div>
 </form></dialog>
 
 <dialog id="pinDlg"><form id="pinForm">
@@ -195,10 +233,22 @@ dialog form{display:grid;gap:12px}
 </form></dialog>
 
 <dialog id="confirmDlg"><form id="confirmForm">
-  <h2>Enter staff PIN</h2>
+  <h2 id="confirmTitle">Owner PIN</h2>
   <p id="confirmMsg" style="margin:0;white-space:pre-line"></p>
-  <input name="pin" type="password" inputmode="numeric" autocomplete="off" required>
+  <div id="confirmExtra" style="display:grid;gap:12px"></div>
+  <input name="pin" type="password" inputmode="numeric" autocomplete="off" required placeholder="PIN">
   <div class="row"><button type="button" data-close>Cancel</button><button class="pri">Confirm</button></div>
+</form></dialog>
+
+<dialog id="tabletDlg"><form id="tabletForm" method="dialog">
+  <h2>This tablet</h2>
+  <p id="tabletWho" style="margin:0"></p>
+  <button type="button" id="roleSwitch" class="pri"></button>
+  <label>Tablet name (shows in the audit log, e.g. Counter, Waiter 1)<input name="device" maxlength="40" autocomplete="off"></label>
+  <label><input type="checkbox" name="phonePrint" style="width:auto"> Print from <b>this phone</b> on its Bluetooth printer
+    (Android: install the free RawBT app and pair the printer in RawBT). Only this phone changes.</label>
+  <button type="button" id="tabletTest">Print a test page</button>
+  <div class="row"><span></span><button class="pri">Done</button></div>
 </form></dialog>
 
 <div id="receipt"></div>
@@ -213,8 +263,10 @@ const PAYMENTS = ['Cash', 'UPI', 'Card'];
 const today = () => new Date().toLocaleDateString('en-CA');  // YYYY-MM-DD, local time
 const mins = t => Math.max(0, Math.round((Date.now() - new Date(t)) / 60000));
 
-let S = {}, items = [], orders = [], cur = null, cart = new Map(), cat = '', view = 'floor', pay = 'Cash', lastBills = [];
-let pin = ''; try { pin = localStorage.getItem('pin') || '' } catch {}
+let S = {}, items = [], orders = [], cur = null, cart = new Map(), cat = '', view = 'floor', lastBills = [];
+let ROLE = 'owner', OWNER_SET = false;  // from the server: which PIN this tablet uses
+const store = (k, v) => { try { if (v === undefined) return localStorage.getItem(k) || ''; localStorage.setItem(k, v) } catch { return '' } };
+let pin = store('pin');
 
 // ---------- server ----------
 let pinWait = null;
@@ -230,37 +282,112 @@ function askPin() {
     d.showModal(); f.pin.focus();
   });
 }
+// network error (Wi-Fi dropped, PC asleep) -> err.offline; the KOT queue below uses it
 async function api(path, body, typedPin) {
-  const r = await fetch(path, {method: body ? 'POST' : 'GET', headers: {'Content-Type': 'application/json', 'X-Pin': typedPin ?? pin},
-                               body: body && JSON.stringify(body)});
+  let r;
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 10000);
+  try {
+    r = await fetch(path, {method: body ? 'POST' : 'GET', signal: ctl.signal, body: body && JSON.stringify(body),
+                           headers: {'Content-Type': 'application/json', 'X-Pin': typedPin ?? pin, 'X-Device': store('device')}});
+  } catch (e) {
+    setOnline(false); throw Object.assign(new Error('offline'), {offline: true});
+  } finally { clearTimeout(timer) }
+  setOnline(true);
   if (r.status === 401 && typedPin !== undefined) { alert('Wrong PIN - nothing was changed.'); throw new Error('wrong PIN') }
   if (r.status === 401) { await askPin(); return api(path, body); }
   const j = await r.json();
-  if (!r.ok) { alert(j.error); throw new Error(j.error); }
+  if (!r.ok) { alert(j.error); throw Object.assign(new Error(j.error), {status: r.status}); }
   return j;
 }
-// Menu, Settings and Close day re-ask for the PIN (the server checks it) so a stray tap can't change them.
-function askConfirmPin(msg) {
+// Owner actions re-ask for the PIN (the server checks it), so a stray tap can't change things and a staff
+// tablet can get the owner's approval on the spot. opts adds fields: reason, check (label), amount, method.
+function askConfirmPin(msg, opts = {}) {
   return new Promise(res => {
     const d = $('#confirmDlg'), f = $('#confirmForm');
     $('#confirmMsg').textContent = msg;
+    $('#confirmTitle').textContent = opts.title || (OWNER_SET ? 'Owner PIN' : 'Enter PIN');
     f.reset();
-    f.onsubmit = e => { e.preventDefault(); const p = f.pin.value; d.close(); res(p) };
+    $('#confirmExtra').innerHTML = (opts.amount !== undefined ? `<label>Amount ₹<input name="amount" type="number" min="0" step="0.01" inputmode="decimal" required value="${opts.amount}"></label>` : '')
+      + (opts.method ? `<label>Given back by<select name="method">${PAYMENTS.map(p => `<option>${p}</option>`).join('')}</select></label>` : '')
+      + (opts.reason ? '<label>Reason (saved in the audit log)<input name="reason" minlength="3" maxlength="200" required autocomplete="off"></label>' : '')
+      + (opts.check ? `<label><input type="checkbox" name="check" style="width:auto"> ${opts.check}</label>` : '');
+    f.onsubmit = e => {
+      e.preventDefault(); const x = f.elements;
+      const out = {pin: x.pin.value, reason: x.reason?.value.trim(), check: x.check?.checked, amount: x.amount?.value, method: x.method?.value};
+      d.close(); res(out);
+    };
     d.onclose = () => res(null);  // Cancel / Esc; ignored if onsubmit already resolved
-    d.showModal(); f.pin.focus();
+    d.showModal(); (f.elements.amount || f.elements.reason || f.pin).focus();
   });
 }
-async function guarded(msg, path, body) {
-  const typed = await askConfirmPin(msg);
-  return typed === null ? null : api(path, body, typed);
+async function guarded(msg, path, body, opts = {}) {
+  const a = await askConfirmPin(msg, opts);
+  if (!a) return null;
+  if (opts.reason) body = {...body, reason: a.reason};
+  return api(path, body, a.pin);
 }
+
+// ---------- offline: KOTs wait on this tablet and send by themselves when the connection is back ----------
+let online = true, queue = [];
+try { queue = JSON.parse(store('queue') || '[]') } catch {}
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+function saveQueue() { store('queue', JSON.stringify(queue)); renderNet() }
+function setOnline(v) { if (online !== v) { online = v; renderNet() } }
+function renderNet() {
+  const b = $('#netBanner');
+  b.hidden = online && !queue.length;
+  b.innerHTML = (online ? '<b>Sending…</b> ' : '<b>No connection to the POS.</b> ')
+    + (queue.length ? `${queue.length} KOT${queue.length > 1 ? 's' : ''} waiting on this tablet (${queue.map(q => esc(q.label)).join(', ')}) - `
+      + 'they go to the kitchen by themselves when the connection is back.' : 'Orders you send now will wait here and go when it is back.')
+    + (online ? '' : ' Billing needs the connection.');
+}
+let flushing = false;
+async function flushQueue() {
+  if (flushing) return; flushing = true;
+  try {
+    while (queue.length) {
+      try { await api('/api/orders/kot', queue[0].body) }
+      catch (e) { if (e.offline) return }  // still offline: try again later; a rejected KOT was shown and is dropped
+      queue.shift(); saveQueue();
+    }
+  } finally { flushing = false }
+}
+
+// ---------- owner / staff ----------
+function renderWho() {
+  document.querySelectorAll('nav .own').forEach(b => b.hidden = ROLE !== 'owner');
+  $('#whoBtn').textContent = (OWNER_SET ? (ROLE === 'owner' ? 'Owner' : 'Staff') : '') + ' ⚙';
+}
+$('#whoBtn').onclick = () => {
+  const f = $('#tabletForm');
+  f.device.value = store('device'); f.phonePrint.checked = phonePrint();
+  $('#tabletWho').innerHTML = !OWNER_SET ? 'One PIN for everyone. Set an <b>owner PIN</b> in Settings to give staff a limited PIN.'
+    : ROLE === 'owner' ? 'This tablet is unlocked for the <b>owner</b>.' : 'This tablet is in <b>staff</b> mode: orders, bills and kitchen.';
+  $('#roleSwitch').hidden = !OWNER_SET;
+  $('#roleSwitch').textContent = ROLE === 'owner' ? 'Lock to staff mode' : 'Owner: unlock this tablet';
+  $('#tabletDlg').showModal();
+};
+$('#tabletForm').device.onchange = e => store('device', e.target.value.trim());
+$('#tabletForm').phonePrint.onchange = e => store('phonePrint', e.target.checked ? '1' : '');
+$('#tabletTest').onclick = () => $('#testPrint').click();
+$('#roleSwitch').onclick = async () => {
+  const toOwner = ROLE !== 'owner';
+  const a = await askConfirmPin(toOwner ? 'Unlock owner screens (dashboard, reports, menu, settings) on this tablet.'
+                                        : 'Type the STAFF PIN to switch this tablet back to staff mode.', {title: toOwner ? 'Owner PIN' : 'Staff PIN'});
+  if (!a) return;
+  const st = await api('/api/state', null, a.pin);
+  if (toOwner !== (st.role === 'owner')) return alert(toOwner ? 'That is not the owner PIN.' : 'That is not the staff PIN.');
+  pin = a.pin; store('pin', pin); $('#tabletDlg').close();
+  await load(); if (ROLE !== 'owner' && $('nav .own.on')) show('floor');
+};
 let working = false;  // one action at a time: stops double-taps creating two KOTs/bills
 async function once(fn) { if (working) return; working = true; try { await fn() } finally { working = false } }
 
 async function load() {
   const st = await api('/api/state');
-  S = st.settings; items = st.items; orders = st.orders;
+  S = st.settings; items = st.items; orders = st.orders; ROLE = st.role; OWNER_SET = st.owner_pin_set;
   $('#rname').textContent = S.name;
+  renderWho();
   if (cur?.id) cur = orders.find(o => o.id === cur.id) || null;
   render();
 }
@@ -272,6 +399,7 @@ function show(v) {
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.view === (v === 'order' ? 'floor' : v)));
   if (v === 'kitchen') loadKitchen();
   if (v === 'reports') { $('#rday').value = S.business_day; loadReport() }
+  if (v === 'dash') loadDash();
   render();
   scrollTo(0, 0);
 }
@@ -296,8 +424,10 @@ function renderFloor() {
   }
   $('#tables').innerHTML = h;
   // business day only moves on "Close day", so remind staff if yesterday was never closed
-  $('#dayBanner').hidden = !(S.business_day < today());
-  $('#dayBanner').innerHTML = `Bills are still going to <b>${fmtDay(S.business_day)}</b>. When you finish for that day, go to <b>Reports → Close day</b>.`;
+  const late = S.business_day < today(), noOwner = ROLE === 'owner' && !OWNER_SET;
+  $('#dayBanner').hidden = !(late || noOwner);
+  $('#dayBanner').innerHTML = (late ? `Bills are still going to <b>${fmtDay(S.business_day)}</b>. When you finish for that day, the owner closes it in <b>Reports → Close day</b>. ` : '')
+    + (noOwner ? 'Tip: set an <b>owner PIN</b> in Settings. The current PIN then becomes the staff PIN - staff can take orders and bill, but not change the menu, give discounts, cancel orders or see reports.' : '');
   $('#others').innerHTML = `<button class="tile add" data-new="takeaway">+ Takeaway</button><button class="tile add" data-new="delivery">+ Delivery</button>`
     + orders.filter(o => o.type !== 'dine_in').map(o =>
       `<button class="tile busy" data-order="${o.id}">${TYPE[o.type]} #${o.id}<small>${esc(o.customer)}</small><small>${tileInfo(o)}</small></button>`).join('');
@@ -379,19 +509,38 @@ $('#back').onclick = () => { if (!cart.size || confirm('Discard items not sent t
 $('#ticket').onclick = e => {
   const b = e.target.closest('button'); if (!b) return;
   if (b.dataset.d) bump(cartKey(b.dataset.id), +b.dataset.d);
-  if (b.dataset.del && confirm('Remove this item from the order?')) once(async () => { await api('/api/orders/remove_line', {line_id: +b.dataset.del}); await load() });
+  if (b.dataset.del) {
+    const l = cur.lines.find(x => x.id === +b.dataset.del);
+    once(async () => {
+      if (await guarded(`Remove ${l.qty} × ${l.name} (${money(l.qty * l.price)}) - already sent to the kitchen?`,
+                        '/api/orders/remove_line', {line_id: l.id}, {reason: true})) await load();
+    });
+  }
 };
+// The order is created with its first KOT. Every KOT carries its own id, so resending after a dropped
+// connection never doubles it; offline, it waits in the queue (survives a page reload).
 async function sendKot() {
-  if (!cart.size) return;
-  if (!cur.id) cur.id = (await api('/api/orders/new', cur)).id;
-  await api('/api/orders/kot', {order_id: cur.id, note: $('#note').value, lines: [...cart].map(([id, qty]) => custom.has(id)
-    ? {name: custom.get(id).name, price: (custom.get(id).price / 100).toFixed(2), qty} : {id, qty})});
+  if (!cart.size) return true;
+  const body = {client_id: uid(), note: $('#note').value, ...(cur.id ? {order_id: cur.id} : {}),
+    order: {type: cur.type, table_no: cur.table_no, customer: cur.customer, phone: cur.phone, address: cur.address},
+    lines: [...cart].map(([id, qty]) => custom.has(id)
+      ? {name: custom.get(id).name, price: (custom.get(id).price / 100).toFixed(2), qty} : {id, qty})};
+  let sent = false;
+  if (!queue.length) {  // keep the kitchen's order: nothing jumps ahead of KOTs already waiting
+    try { cur.id = (await api('/api/orders/kot', body)).order_id; sent = true }
+    catch (e) { if (!e.offline) throw e }
+  }
+  if (!sent) { queue.push({body, label: orderTitle(cur)}); saveQueue(); flushQueue() }
   cart.clear(); $('#note').value = '';
-  await load();
+  await load().catch(() => {});
+  return sent;
 }
 $('#sendKot').onclick = () => once(async () => { await sendKot(); cur = null; show('floor') });
-$('#cancelOrder').onclick = () => confirm('Cancel this whole order? It will show in reports as cancelled.') &&
-  once(async () => { await api('/api/orders/cancel', {order_id: cur.id}); cur = null; cart.clear(); await load(); show('floor') });
+$('#cancelOrder').onclick = () => once(async () => {
+  if (!await guarded(`Cancel the whole order for ${orderTitle(cur)} (${money(cur.amount)})?\nIt shows in reports and the audit log as cancelled.`,
+                     '/api/orders/cancel', {order_id: cur.id}, {reason: true})) return;
+  cur = null; cart.clear(); await load(); show('floor');
+});
 
 // ---------- billing ----------
 let discMode = '%';
@@ -401,28 +550,94 @@ function calc(lines, disc) {  // preview only - mirrors totals() in app.py, whic
   const g = Math.round((sub - dis) * (+S.tax_pct / 2) / 100), raw = sub - dis + 2 * g, total = Math.floor((raw + 50) / 100) * 100;
   return {sub, dis, cgst: g, sgst: g, ro: total - raw, total};
 }
+// pays: [{method, amount}] in paise. One row = the whole bill; more rows = split payment / split between people.
+let pays = [], picked = new Set(), billTotal = 0;
 $('#billBtn').onclick = () => once(async () => {
-  await sendKot();  // anything still in the cart goes to the kitchen first, so the bill matches what was ordered
+  // anything still in the cart goes to the kitchen first, so the bill matches what was ordered
+  if (!await sendKot() || !online) return alert('No connection to the POS - the items are queued for the kitchen, but billing needs the connection. Try again in a moment.');
   if (!cur) return;
-  pay = 'Cash'; discMode = '%'; $('#bdisc').value = 0; $('#billTitle').textContent = 'Bill · ' + orderTitle(cur);
-  renderBill(); $('#billDlg').showModal();
+  discMode = '%'; $('#bdisc').value = 0; $('#billTitle').textContent = 'Bill · ' + orderTitle(cur);
+  picked = new Set(cur.lines.map(l => l.id)); pays = [{method: 'Cash', amount: 0}];
+  $('#splitBox').open = false;
+  $('#billLines').innerHTML = cur.lines.map(l => `<label><input type="checkbox" data-line="${l.id}" checked> ${l.qty} × ${esc(l.name)}
+      <span style="margin-left:auto">${money(l.qty * l.price)}</span></label>`).join('');
+  $('#discWho').textContent = ROLE === 'owner' ? '' : '(needs the owner PIN)';
+  renderBill(); renderPays(); $('#billDlg').showModal();
 });
 function renderBill() {
-  $('#payBtns').innerHTML = PAYMENTS.map(p => `<button type="button" class="${p === pay ? 'on' : ''}" data-pay="${p}">${p}</button>`).join('');
   document.querySelectorAll('#discMode button').forEach(b => b.classList.toggle('on', b.dataset.mode === discMode));
-  const v = +$('#bdisc').value || 0, t = calc(cur.lines, v), h = +S.tax_pct / 2;
-  $('#bsum').innerHTML = row('Subtotal', money(t.sub)) + (t.dis ? row(discMode === '%' ? `Discount ${v}%` : 'Discount', '−' + money(t.dis)) : '')
+  const v = +$('#bdisc').value || 0, t = calc(cur.lines.filter(l => picked.has(l.id)), v), h = +S.tax_pct / 2;
+  billTotal = t.total;
+  if (pays.length === 1) pays[0].amount = t.total;
+  $('#bsum').innerHTML = (picked.size < cur.lines.length ? `<div class="mute">${picked.size} of ${cur.lines.length} items</div>` : '')
+    + row('Subtotal', money(t.sub)) + (t.dis ? row(discMode === '%' ? `Discount ${v}%` : 'Discount', '−' + money(t.dis)) : '')
     + row(`CGST ${h}%`, money(t.cgst)) + row(`SGST ${h}%`, money(t.sgst)) + (t.ro ? row('Round off', money(t.ro)) : '')
     + row('Total', money(t.total), 'big');
+  payLeft();
 }
-$('#payBtns').onclick = e => { const b = e.target.closest('button'); if (b) { pay = b.dataset.pay; renderBill() } };
+function renderPays() {  // rebuilds the rows - only on add/remove/split, so typing keeps focus
+  const one = pays.length === 1;
+  $('#payRows').innerHTML = pays.map((p, i) => `<div class="payrow">
+      <select data-m="${i}">${PAYMENTS.map(m => `<option ${m === p.method ? 'selected' : ''}>${m}</option>`).join('')}</select>
+      <input data-a="${i}" type="number" min="0" step="1" inputmode="decimal" value="${p.amount / 100}" ${one ? 'disabled' : ''} aria-label="Amount ₹">
+      ${one ? '<span></span>' : `<button type="button" class="x" data-rm="${i}" aria-label="Remove payment">✕</button>`}</div>`).join('');
+  payLeft();
+}
+function payLeft() {
+  if (pays.length === 1) {
+    pays[0].amount = billTotal;
+    const inp = $('#payRows input'); if (inp) inp.value = billTotal / 100;
+  }
+  const left = billTotal - pays.reduce((a, p) => a + p.amount, 0);
+  $('#payLeft').textContent = !left ? '' : left > 0 ? `${money(left)} still to pay` : `${money(-left)} more than the bill`;
+  $('#payLeft').style.color = left ? 'var(--acc)' : '';
+  $('#billOk').disabled = !!left || !picked.size;
+}
+$('#payRows').oninput = e => {
+  const i = e.target.dataset.a ?? e.target.dataset.m; if (i === undefined) return;
+  if (e.target.dataset.a !== undefined) {
+    pays[i].amount = Math.round((parseFloat(e.target.value) || 0) * 100);
+    const last = pays.length - 1;
+    if (+i < last) {  // "₹500 cash, rest by UPI": the last row takes whatever is left
+      pays[last].amount = Math.max(0, billTotal - pays.slice(0, last).reduce((a, p) => a + p.amount, 0));
+      document.querySelector(`#payRows [data-a="${last}"]`).value = pays[last].amount / 100;
+    }
+  } else pays[i].method = e.target.value;
+  payLeft();
+};
+$('#payRows').onclick = e => { const i = e.target.closest('[data-rm]')?.dataset.rm; if (i !== undefined) { pays.splice(+i, 1); renderPays() } };
+$('#addPay').onclick = () => {
+  const left = billTotal - pays.reduce((a, p) => a + p.amount, 0);
+  if (pays.length === 1) { pays[0].amount = 0; pays.push({method: 'UPI', amount: billTotal}) }  // e.g. type the cash, UPI takes the rest
+  else pays.push({method: 'UPI', amount: Math.max(left, 0)});
+  renderPays(); $('#payRows input')?.focus();
+};
+document.querySelectorAll('[data-eq]').forEach(b => b.onclick = () => {  // one bill, each person pays an equal share
+  const n = +b.dataset.eq, share = Math.floor(billTotal / n / 100) * 100;
+  pays = Array.from({length: n}, (_, i) => ({method: pays[i]?.method || 'Cash', amount: i < n - 1 ? share : billTotal - share * (n - 1)}));
+  renderPays();
+});
+$('#billLines').onchange = e => {
+  const id = +e.target.dataset.line; if (!id) return;
+  e.target.checked ? picked.add(id) : picked.delete(id);
+  renderBill();
+};
 $('#bdisc').oninput = renderBill;
 $('#discMode').onclick = e => { const b = e.target.closest('button'); if (b) { discMode = b.dataset.mode; renderBill(); $('#bdisc').focus() } };
 $('#billForm').onsubmit = e => {
   e.preventDefault();
   once(async () => {
     const v = +$('#bdisc').value || 0;
-    const b = await api('/api/orders/bill', {order_id: cur.id, payment: pay, ...(discMode === '₹' ? {discount_amt: v} : {discount_pct: v})});
+    const body = {order_id: cur.id, ...(discMode === '₹' ? {discount_amt: v} : {discount_pct: v}),
+      ...(picked.size < cur.lines.length ? {line_ids: [...picked]} : {}),
+      ...(pays.length > 1 ? {payments: pays.map(p => ({method: p.method, amount: (p.amount / 100).toFixed(2)}))} : {payment: pays[0].method})};
+    let typed;
+    if (v && ROLE !== 'owner') {  // discount from a staff tablet: the owner approves it here
+      const a = await askConfirmPin(`Give a discount of ${discMode === '%' ? v + '%' : '₹' + v} on ${orderTitle(cur)}?`, {reason: true});
+      if (!a) return;
+      typed = a.pin; body.reason = a.reason;
+    }
+    const b = await api('/api/orders/bill', body, typed);
     $('#billDlg').close(); cur = null; cart.clear();
     printReceipt(b);
     await load(); show('floor');
@@ -446,13 +661,15 @@ function printReceipt(b) {
   $('#receipt').innerHTML = `<div class="c"><b class="big">${esc(S.name)}</b>`
     + (S.address ? '<br>' + esc(S.address) : '') + (S.phone ? '<br>Ph: ' + esc(S.phone) : '')
     + (S.gstin ? '<br>GSTIN: ' + esc(S.gstin) : '') + (S.fssai ? '<br>FSSAI: ' + esc(S.fssai) : '')
-    + '<br><b>TAX INVOICE</b></div><hr>'
+    + '<br><b>TAX INVOICE</b>' + (b.voided ? '<br><b>*** VOID - NOT PAYABLE ***</b>' : '') + '</div><hr>'
     + row('Bill No: ' + esc(b.bill_label), when) + row(TYPE[b.type] + (b.table_no ? ' · Table ' + b.table_no : ''), 'Paid: ' + esc(b.payment))
     + (b.customer || b.phone ? `<div>${esc(b.customer)} ${esc(b.phone)}</div>` : '') + (b.address ? `<div>${esc(b.address)}</div>` : '')
     + '<hr>' + b.lines.map(l => row(`${esc(l.name)}<br>&nbsp; ${l.qty} × ${money(l.price)}`, money(l.qty * l.price))).join('')
     + '<hr>' + row('Subtotal', money(b.subtotal)) + (b.discount ? row(+b.discount_pct ? `Discount (${b.discount_pct}%)` : 'Discount', '−' + money(b.discount)) : '')
     + row(`CGST @ ${h}%`, money(b.cgst)) + row(`SGST @ ${h}%`, money(b.sgst)) + (b.round_off ? row('Round off', money(b.round_off)) : '')
-    + '<hr>' + row('TOTAL', money(b.total), 'big') + `<hr><div class="c">${esc(S.footer)}</div>`;
+    + '<hr>' + row('TOTAL', money(b.total), 'big')
+    + ((b.payments || []).length > 1 ? '<hr>' + b.payments.map(p => row('Paid ' + esc(p.method), money(p.amount))).join('') : '')
+    + `<hr><div class="c">${esc(S.footer)}</div>`;
   browserPrint();
 }
 
@@ -487,21 +704,53 @@ async function loadReport() {
   const list = (title, obj, name = k => k) => `<div class="card"><h3 style="margin-top:0">${title}</h3>`
     + (Object.entries(obj).map(([k, v]) => row(esc(name(k)), money(v))).join('') || '<p class="mute">No sales</p>') + '</div>';
   lastBills = r.bills;
-  $('#rep').innerHTML = `<div class="stats">${tile('Net sales', money(s.total))}${tile('Bills', r.count)}
-      ${tile('GST collected', money(s.cgst + s.sgst))}${tile('Discounts given', money(s.discount))}${tile('Cancelled orders', r.cancelled)}</div>
-    <div class="cols">${list('By payment', r.by_payment)}${list('By order type', r.by_type, k => TYPE[k])}</div>
+  const aud = await api('/api/audit?day=' + r.day);
+  const ACT = {cancel_order: 'Cancelled order', remove_item: 'Removed item', void_bill: 'Voided bill', refund: 'Refund',
+               discount: 'Discount', menu_save: 'Menu change', menu_delete: 'Menu delete', settings: 'Settings', close_day: 'Closed day'};
+  $('#rep').innerHTML = `<div class="stats">${tile('Net sales', money(r.net))}${tile('Bills', r.count)}
+      ${tile('GST collected', money(s.cgst + s.sgst))}${tile('Discounts given', money(s.discount))}${tile('Cancelled orders', r.cancelled)}
+      ${tile('Voided bills', r.voided.count + (r.voided.count ? ' · ' + money(r.voided.total) : ''))}${tile('Refunds', money(r.refunds))}</div>
+    <div class="cols">${list('By payment (after refunds)', r.by_payment)}${list('By order type', r.by_type, k => TYPE[k])}</div>
     <div class="card"><h3 style="margin-top:0">Item-wise sales (before discount)</h3><table><tr><th>Item</th><th class="r">Qty</th><th class="r">Amount</th></tr>
       ${r.items.map(([n, q, a]) => `<tr><td>${esc(n)}</td><td class="r">${q}</td><td class="r">${money(a)}</td></tr>`).join('')}</table></div>
     <div class="card"><h3 style="margin-top:0">Bills</h3><table><tr><th>No</th><th>Time</th><th>Order</th><th>Paid</th><th class="r">Total</th><th></th></tr>
-      ${r.bills.map(b => `<tr><td>${b.day_no ?? b.bill_no}</td><td>${b.billed.slice(11, 16)}</td><td>${TYPE[b.type]}${b.table_no ? ' T' + b.table_no : ''}</td>
-        <td>${esc(b.payment)}</td><td class="r">${money(b.total)}</td><td class="r"><button data-reprint="${b.id}">Reprint</button></td></tr>`).join('')}</table></div>`;
+      ${r.bills.map(b => `<tr class="${b.voided ? 'void' : ''}"><td>${b.day_no ?? b.bill_no}</td><td>${b.billed.slice(11, 16)}</td><td>${TYPE[b.type]}${b.table_no ? ' T' + b.table_no : ''}</td>
+        <td>${b.payments.length > 1 ? b.payments.map(p => esc(p.method) + ' ' + money(p.amount)).join(' + ') : esc(b.payment)}</td>
+        <td class="r">${money(b.total)}${b.refunded ? `<br><small class="mute">refunded ${money(b.refunded)}</small>` : ''}</td>
+        <td class="r" style="white-space:nowrap">${b.voided ? `<span class="tag" title="${esc(b.void_reason)}">VOID</span> ` : ''}<button data-reprint="${b.id}">Reprint</button>
+          ${b.voided ? '' : `<button data-refund="${b.id}">Refund</button> <button class="warn" data-void="${b.id}">Void</button>`}</td></tr>`).join('')}</table></div>
+    <div class="card"><h3 style="margin-top:0">Audit log - who did what</h3>${aud.length ? `<table><tr><th>Time</th><th>Who</th><th>What</th><th class="r">Amount</th><th>Reason / details</th></tr>
+      ${aud.map(a => `<tr><td>${a.at.slice(11, 16)}</td><td>${esc(a.role)}${a.device ? '<br><small class="mute">' + esc(a.device) + '</small>' : ''}</td>
+        <td>${esc(ACT[a.action] || a.action)}${a.order_id ? ` <small class="mute">#${a.order_id}</small>` : ''}</td><td class="r">${a.amount ? money(a.amount) : ''}</td>
+        <td>${a.reason ? '<b>' + esc(a.reason) + '</b><br>' : ''}<small class="mute">${esc(a.detail)}</small></td></tr>`).join('')}</table>`
+      : '<p class="mute">Nothing cancelled, voided, refunded or changed this day.</p>'}</div>`;
 }
-$('#rep').onclick = e => { const id = e.target.closest('button')?.dataset.reprint; if (id) printReceipt(lastBills.find(b => b.id === +id)) };
+$('#rep').onclick = e => {
+  const t = e.target.closest('button')?.dataset; if (!t) return;
+  const b = lastBills.find(x => x.id === +(t.reprint || t.refund || t.void));
+  if (t.reprint) return printReceipt(b);
+  const label = `bill ${b.bill_label} (${money(b.total)})`;
+  if (t.void) once(async () => {
+    const a = await askConfirmPin(`Void ${label}? It keeps its number but leaves the totals, and shows as VOID.`,
+                                  {reason: true, check: 'Reopen the items as an open order to correct and bill again'});
+    if (!a) return;
+    const res = await api('/api/bills/void', {order_id: b.id, reason: a.reason, reopen: a.check}, a.pin);
+    if (res.reopened) alert('Voided. The items are back as an open order on the Tables screen - correct them and bill again.');
+    await load(); await loadReport();
+  });
+  if (t.refund) once(async () => {
+    const a = await askConfirmPin(`Refund on ${label}${b.refunded ? `, already refunded ${money(b.refunded)}` : ''}.`,
+                                  {reason: true, amount: (b.total - b.refunded) / 100, method: true});
+    if (!a) return;
+    await api('/api/bills/refund', {order_id: b.id, amount: a.amount, method: a.method, reason: a.reason}, a.pin);
+    await loadReport();
+  });
+};
 $('#dayBtn').onclick = () => {
   const r = lastReport; if (!r) return;
   if (!r.open) return printDayReport(r);
   once(async () => {
-    const res = await guarded(`Close ${fmtDay(r.day)}?\n${r.count} bills, net ${money(r.sums.total)}.\nThe daily report will print and new bills will go to the next day.`,
+    const res = await guarded(`Close ${fmtDay(r.day)}?\n${r.count} bills, net ${money(r.net)}.\nThe daily report will print and new bills will go to the next day.`,
                               '/api/day/close', {day: r.day});
     if (!res) return;
     printDayReport(res.report);
@@ -518,7 +767,9 @@ function printDayReport(r) {  // end-of-day report (Z report)
     + row('Bills', r.count) + row('Cancelled orders', r.cancelled) + '<hr>'
     + row('Gross (before discount)', money(s.subtotal)) + row('Discounts', '−' + money(s.discount))
     + row(`CGST @ ${h}%`, money(s.cgst)) + row(`SGST @ ${h}%`, money(s.sgst)) + row('Round off', money(s.round_off))
-    + '<hr>' + row('NET SALES', money(s.total), 'big') + '<hr><b>By payment</b>'
+    + (r.voided?.count ? row(`Voided bills (${r.voided.count})`, money(r.voided.total)) : '')
+    + (r.refunds ? row('Bills total', money(s.total)) + row('Refunds', '−' + money(r.refunds)) : '')
+    + '<hr>' + row('NET SALES', money(r.net ?? s.total), 'big') + '<hr><b>By payment</b>'
     + (Object.entries(r.by_payment).map(([k, v]) => row(esc(k), money(v))).join('') || '<div>-</div>')
     + '<hr><b>By order type</b>' + (Object.entries(r.by_type).map(([k, v]) => row(TYPE[k], money(v))).join('') || '<div>-</div>')
     + '<hr><b>Items sold</b>' + (r.items.map(([n, q, a]) => row(`${q} × ${esc(n)}`, money(a))).join('') || '<div>-</div>')
@@ -556,16 +807,16 @@ const FIELDS = [['name', 'Restaurant name'], ['address', 'Address'], ['phone', '
   ['fssai', 'FSSAI licence no. (required on bills)'], ['tax_pct', 'GST % (split equally into CGST + SGST)'],
   ['tables', 'Number of dine-in tables'], ['footer', 'Receipt footer'],
   ['printer', 'Receipt printer (pair a Bluetooth printer with the counter PC first)'], ['paper', 'Paper width'],
-  ['pin', 'New staff PIN, 6+ digits (blank = keep current)']];
+  ['owner_pin', 'New OWNER PIN, 6+ digits (blank = keep current). Only the owner can then change the menu, give discounts, cancel/void/refund, close the day and see reports.'],
+  ['pin', 'New STAFF PIN, 6+ digits (blank = keep current). Staff take orders, bill and run the kitchen.']];
+const PINS = ['pin', 'owner_pin'];
 const fieldInput = k => k === 'printer' ? '<select name="printer"><option value="">No printer - use the print dialog</option></select>'
   : k === 'paper' ? '<select name="paper"><option value="58">58 mm (2 inch)</option><option value="80">80 mm (3 inch)</option></select>'
-  : `<input name="${k}" ${k === 'pin' ? 'type="password" inputmode="numeric"' : ''} autocomplete="off">`;
+  : `<input name="${k}" ${PINS.includes(k) ? 'type="password" inputmode="numeric"' : ''} autocomplete="off">`;
 $('#setForm').innerHTML = FIELDS.map(([k, l]) => `<label>${l}${fieldInput(k)}</label>`).join('')
-  + `<label><input type="checkbox" id="phonePrint" style="width:auto"> Print from <b>this phone</b> on its Bluetooth printer
-      (Android: install the free RawBT app, pair the printer in RawBT, same paper width as above). Only this phone changes.</label>`
+  + '<p class="mute" style="margin:0;font-size:14px">Tablet name and "print from this phone" are under ⚙ at the top right, on each tablet.</p>'
   + '<button class="pri">Save settings</button><button type="button" id="testPrint">Print a test page</button>'
   + '<button type="button" id="backupBtn">Download backup of all data</button>';
-$('#phonePrint').onchange = e => { try { localStorage.setItem('phonePrint', e.target.checked ? '1' : '') } catch {} };
 $('#testPrint').onclick = () => {
   if (phonePrint()) return directPrint({test: true});
   if (!S.printer) return alert('Choose the printer above (or tick "Print from this phone") and press Save settings first.');
@@ -579,8 +830,7 @@ $('#backupBtn').onclick = () => once(async () => {
 });
 function renderSettings() {
   const f = $('#setForm');
-  for (const [k] of FIELDS) if (k !== 'printer') f.elements[k].value = k === 'pin' ? '' : S[k] ?? '';
-  $('#phonePrint').checked = phonePrint();
+  for (const [k] of FIELDS) if (k !== 'printer') f.elements[k].value = PINS.includes(k) ? '' : S[k] ?? '';
   api('/api/printers').then(r => {  // COM ports on the counter PC; Bluetooth printers get one when paired
     const ports = r.ports.map(p => p.port);
     if (S.printer && !ports.includes(S.printer)) ports.push(S.printer);  // saved one, even if unpaired right now
@@ -594,20 +844,76 @@ $('#setForm').onsubmit = e => {
   e.preventDefault();
   once(async () => {
     const d = Object.fromEntries(new FormData(e.target));
-    if (!await guarded('Save these settings?' + (d.pin ? '\nThis also changes the staff PIN (type the current one).' : ''), '/api/settings', d)) return;
-    if (d.pin) { pin = d.pin; try { localStorage.setItem('pin', pin) } catch {} }
-    await load(); alert('Settings saved');
+    if (!await guarded('Save these settings?' + (d.owner_pin || d.pin ? '\nThis changes a PIN - type the current owner PIN to confirm.' : ''), '/api/settings', d)) return;
+    // this tablet keeps owner rights: it follows the new owner PIN (or the only PIN while there is no owner PIN)
+    if (d.owner_pin) pin = d.owner_pin; else if (d.pin && !OWNER_SET) pin = d.pin;
+    store('pin', pin);
+    await load(); alert('Settings saved' + (d.owner_pin ? '. Staff tablets keep using the staff PIN; this tablet now uses the owner PIN.' : ''));
   });
 };
 
+// ---------- dashboard (owner) ----------
+let period = '7';
+const hr = h => `${h % 12 || 12}${h < 12 ? 'am' : 'pm'}`;
+$('#dPeriod').onclick = e => { const p = e.target.closest('button')?.dataset.p; if (p) { period = p; loadDash() } };
+async function loadDash() {
+  document.querySelectorAll('#dPeriod button').forEach(b => b.classList.toggle('on', b.dataset.p === period));
+  const d = await api('/api/dashboard?period=' + period);
+  if (view !== 'dash') return;
+  const pname = {today: 'today', 7: 'last 7 days', 30: 'last 30 days'}[period];
+  const tile = (l, v, sub = '') => `<div class="card"><small class="mute">${l}</small><b>${v}</b>${sub ? `<small class="mute">${sub}</small>` : ''}</div>`;
+  const diff = d.last_week_same_days ? Math.round((d.week_so_far - d.last_week_same_days) * 100 / d.last_week_same_days) : null;
+  // this week vs last week: grey = last week, red = this week, same scale
+  const wmax = Math.max(1, ...d.week.flatMap(w => [w.this || 0, w.last]));
+  const wd = w => new Date(w.day + 'T00:00').toLocaleDateString('en-IN', {weekday: 'short'});
+  const week = `<div class="legend"><span><i style="background:#a8a195"></i>Last week</span><span><i style="background:var(--acc)"></i>This week</span></div>
+    <div class="vb">${d.week.map(w => `<div class="c">
+      <div class="b last" style="height:${w.last * 100 / wmax}%" title="${wd(w)} last week: ${money(w.last)}"></div>
+      ${w.this === null ? '<div class="b" style="background:none"></div>' : `<div class="b" style="height:${w.this * 100 / wmax}%" title="${wd(w)} this week: ${money(w.this)}"></div>`}</div>`).join('')}</div>
+    <div class="vx">${d.week.map(w => `<span>${wd(w)}</span>`).join('')}</div>`;
+  const imax = Math.max(1, ...d.top_items.map(i => i[1]));
+  const top = d.top_items.length ? d.top_items.map(([n, q, a]) => `<div class="hb" title="${esc(n)}: ${q} sold, ${money(a)}"><span>${esc(n)}</span>
+      <div class="tr"><div class="b" style="width:${q * 100 / imax}%"></div></div><span class="r"><b>${q}</b> <small class="mute">${money(a)}</small></span></div>`).join('')
+    : '<p class="mute">No sales in this period.</p>';
+  const hours = Object.keys(d.hours).map(Number);
+  let hourChart = '<p class="mute">No sales in this period.</p>', busiest = '';
+  if (hours.length) {
+    const lo = Math.min(...hours), hi = Math.max(...hours), hmax = Math.max(...hours.map(h => d.hours[h].bills));
+    const span = Array.from({length: hi - lo + 1}, (_, i) => lo + i);
+    const b = hours.reduce((x, h) => d.hours[h].bills > d.hours[x].bills ? h : x, hours[0]);
+    busiest = `Busiest: <b>${hr(b)}–${hr((b + 1) % 24)}</b> with ${d.hours[b].bills} bills (${money(d.hours[b].sales)})`;
+    hourChart = `<div class="vb">${span.map(h => { const x = d.hours[h] || {bills: 0, sales: 0};
+        return `<div class="c"><div class="b" style="height:${x.bills * 100 / hmax}%" title="${hr(h)}–${hr((h + 1) % 24)}: ${x.bills} bills, ${money(x.sales)}"></div></div>` }).join('')}</div>
+      <div class="vx">${span.map(h => `<span>${span.length > 12 && h % 2 ? '' : hr(h)}</span>`).join('')}</div>`;
+  }
+  const ptot = Object.values(d.payments).reduce((a, v) => a + Math.max(v, 0), 0) || 1;
+  const pay = PAYMENTS.filter(m => d.payments[m]).map(m => `<div class="hb"><span>${m}</span>
+      <div class="tr"><div class="b" style="width:${Math.max(d.payments[m], 0) * 100 / ptot}%"></div></div>
+      <span class="r"><b>${money(d.payments[m])}</b> <small class="mute">${Math.round(Math.max(d.payments[m], 0) * 100 / ptot)}%</small></span></div>`).join('')
+    || '<p class="mute">No payments in this period.</p>';
+  $('#dashBody').innerHTML = `<div class="stats">
+      ${tile("Today's sales", money(d.today.net), fmtDay(d.day))}${tile('Bills today', d.today.bills)}${tile('Average bill', money(d.today.avg))}
+      ${tile('This week so far', money(d.week_so_far), diff === null ? 'no sales on these days last week'
+        : `${diff >= 0 ? '▲' : '▼'} ${Math.abs(diff)}% vs same days last week (${money(d.last_week_same_days)})`)}</div>
+    <div class="card"><h3 style="margin-top:0">This week vs last week (net sales by day)</h3>${week}
+      <p class="mute" style="margin:8px 0 0;font-size:13px">Last week in full: ${money(d.last_week_total)}</p></div>
+    <div class="cols">
+      <div class="card"><h3 style="margin-top:0">Top items · ${pname} (qty sold)</h3>${top}</div>
+      <div class="card"><h3 style="margin-top:0">Cash vs UPI vs Card · ${pname} (after refunds)</h3>${pay}</div></div>
+    <div class="card"><h3 style="margin-top:0">Busiest hours · ${pname} (bills per hour)</h3>
+      <p style="margin:0 0 8px">${busiest}</p>${hourChart}</div>`;
+}
+
 // ---------- live refresh: other tablets' orders and new KOTs show up within a few seconds ----------
 setInterval(() => {
+  if (queue.length) flushQueue().then(() => view === 'floor' && load().catch(() => {}));
   if (document.hidden || working || document.querySelector('dialog[open]')) return;
   if (view === 'kitchen') loadKitchen().catch(() => {});
   if (view === 'floor') load().catch(() => {});
 }, 5000);
 
-load().then(() => show('floor'));
+renderNet();
+load().then(() => show('floor')).catch(() => {}).finally(() => flushQueue());  // offline at start: the 5 s refresh retries
 </script>
 </body>
 </html>

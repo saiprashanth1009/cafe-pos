@@ -78,6 +78,11 @@ class Window:
         self.auto_var = tk.BooleanVar(value=self.auto_on)
         auto = ttk.Checkbutton(top, text="Auto-update", variable=self.auto_var, command=self.toggle_auto)
         auto.grid(row=self.rows["upd"]["row"], column=4, padx=2, sticky="w")
+        self.start_var = tk.BooleanVar(value=updater.can_self_update() and updater.autostart_enabled())
+        start = ttk.Checkbutton(top, text="Start with Windows", variable=self.start_var, command=self.toggle_autostart)
+        start.grid(row=self.rows["upd"]["row"] + 1, column=2, sticky="w", padx=6, pady=(2, 0))
+        if not updater.can_self_update():
+            start.state(["disabled"])
         mine = updater.current()
         if not updater.can_self_update():
             auto.state(["disabled"])
@@ -283,6 +288,14 @@ class Window:
         self.auto_on = self.auto_var.get()
         updater.save_prefs({"auto": self.auto_on})
         log.info("Auto-update %s", "on - new versions install by themselves when no orders are open" if self.auto_on else "off")
+
+    def toggle_autostart(self):
+        try:
+            updater.set_autostart(self.start_var.get())
+            log.info("Start with Windows %s", "on - the POS opens by itself when this PC signs in" if self.start_var.get() else "off")
+        except OSError as e:
+            self.start_var.set(not self.start_var.get())
+            log.error("Could not change Start with Windows: %s", e)
 
     def update_button(self):
         """'Check now', or 'Update now' once a newer build has been found."""

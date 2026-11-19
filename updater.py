@@ -105,6 +105,31 @@ def relaunch(from_build):
     subprocess.Popen([str(EXE)], env=env, close_fds=True, creationflags=flags, cwd=str(EXE.parent))
 
 
+RUN_KEY, RUN_NAME = r"Software\Microsoft\Windows\CurrentVersion\Run", "CafePOS"
+
+
+def autostart_enabled():
+    """True when Windows opens this exe at sign-in (current user's Run key - no admin needed)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            return winreg.QueryValueEx(k, RUN_NAME)[0].strip('"').lower() == str(EXE).lower()
+    except OSError:
+        return False
+
+
+def set_autostart(on):
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if on:  # same path after updates (the exe is swapped in place), so this stays valid
+            winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, f'"{EXE}"')
+        else:
+            try:
+                winreg.DeleteValue(k, RUN_NAME)
+            except FileNotFoundError:
+                pass
+
+
 def cleanup():
     """After an update: remove the previous exe and any half-finished download."""
     for p in (OLD, NEW):
