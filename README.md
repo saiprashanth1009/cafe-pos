@@ -77,3 +77,6 @@ Any 80 mm thermal printer that the tablet can see works.
 
 ## Checks
 `python app.py test` runs the GST and rounding maths and a full order → KOT → bill → report flow against a throwaway database.
+
+## License
+MIT. See [LICENSE](LICENSE). Originally created by [muchkurisrivardhan](https://github.com/muchkurisrivardhan/cafe-pos).
