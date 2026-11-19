@@ -78,5 +78,12 @@ Any 80 mm thermal printer that the tablet can see works.
 ## Checks
 `python app.py test` runs the GST and rounding maths and a full order → KOT → bill → report flow against a throwaway database.
 
+## Updates
+Every push to `main` builds a new `CafePOS.exe` on the GitHub release **latest**, with a build number. The **Updates** row in the CafePOS window:
+- **Auto-update** (on by default): checks GitHub every 30 minutes and installs a new build by itself once no orders are open.
+- **Check now / Update now**: check right away, or install a build that was found.
+
+An update downloads the new exe, checks its SHA-256, swaps it in place of the running one and restarts (about 10-20 s; tablets reconnect and the public link stays on). Bills, menu, settings and logs live in `%LOCALAPPDATA%\CafePOS`, outside the exe, so nothing is lost and nothing needs reinstalling.
+
 ## License
 MIT. See [LICENSE](LICENSE). Originally created by [muchkurisrivardhan](https://github.com/muchkurisrivardhan/cafe-pos).

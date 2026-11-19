@@ -8,6 +8,7 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 import app
+import updater
 
 PORT = app.PORT
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # don't flash a console for every tailscale call
@@ -39,6 +40,8 @@ class Window:
         self.root, self.q, self.server = root, queue.Queue(), None
         self.closing, self.opened_urls, self.helper = False, set(), None  # helper: running tailscale login/funnel
         self.dns_fixed = False
+        self.update_info, self.installing, self.waiting_logged = None, False, False
+        self.auto_on = updater.load_prefs()["auto"] and updater.can_self_update()
         root.title("Guns & Roses Café POS")
         root.geometry("900x600")
         root.minsize(680, 440)
@@ -57,7 +60,8 @@ class Window:
                                          ("Copy", lambda: self.copy("pub"))]),
                  ("lan", "Same Wi-Fi", [("Copy", lambda: self.copy("lan"))]),
                  ("ts", "Tailscale", [("Sign in", None)]),  # action button, shown only when Tailscale needs you
-                 ("db", "Database", [("Open folder", lambda: os.startfile(app.DB.parent))])]
+                 ("db", "Database", [("Open folder", lambda: os.startfile(app.DB.parent))]),
+                 ("upd", "Updates", [("Check now", self.update_button)])]
         for i, (key, title, buttons) in enumerate(specs, start=2):
             dot = tk.Label(top, text="●", fg=COLORS["grey"], font=("Segoe UI", 13))
             dot.grid(row=i, column=0, padx=(0, 6))
@@ -69,8 +73,17 @@ class Window:
                 b = ttk.Button(top, text=label, command=cmd)
                 b.grid(row=i, column=3 + j, padx=2)
                 btns.append(b)
-            self.rows[key] = {"dot": dot, "var": var, "btns": btns}
+            self.rows[key] = {"dot": dot, "var": var, "btns": btns, "row": i}
         self.rows["ts"]["btns"][0].grid_remove()
+        self.auto_var = tk.BooleanVar(value=self.auto_on)
+        auto = ttk.Checkbutton(top, text="Auto-update", variable=self.auto_var, command=self.toggle_auto)
+        auto.grid(row=self.rows["upd"]["row"], column=4, padx=2, sticky="w")
+        mine = updater.current()
+        if not updater.can_self_update():
+            auto.state(["disabled"])
+            self.rows["upd"]["var"].set("Running from source (python gui.py) - update with: git pull")
+        else:
+            self.rows["upd"]["var"].set(f"Build {mine['build']} ({mine['sha']}) - checking for updates…")
 
         ttk.Label(root, text="Live log", font=("Segoe UI", 10, "bold"), padding=(14, 6, 0, 2)).pack(anchor="w")
         box = ttk.Frame(root, padding=(14, 0, 14, 14))
@@ -119,6 +132,11 @@ class Window:
                     b.grid()
                 else:
                     b.grid_remove()
+            elif msg[0] == "updbtn":
+                self.rows["upd"]["btns"][0].configure(text=msg[1])
+            elif msg[0] == "restart":
+                self.restart_into_update()
+                return
         self.root.after(150, self.pump)
 
     def open_url(self, url):
@@ -132,11 +150,19 @@ class Window:
 
     # ---------------- POS server ----------------
     def start_server(self):
-        try:
-            self.server = app.make_server(PORT)
-        except OSError as e:
+        # right after an update the previous copy may need a moment to let go of the port
+        tries = 15 if os.environ.get("CAFEPOS_UPDATED_FROM") else 1
+        for attempt in range(tries):
+            try:
+                self.server = app.make_server(PORT)
+                break
+            except OSError as e:
+                err = e
+                if attempt + 1 < tries:
+                    time.sleep(1)
+        else:
             self.set("pos", "red", f"Port {PORT} is busy - is the POS already open in another window?")
-            log.error("Could not start the POS on port %s: %s", PORT, e)
+            log.error("Could not start the POS on port %s: %s", PORT, err)
             messagebox.showerror("POS already running?",
                                  f"Port {PORT} is already in use.\nClose the other POS window (or the old black window) and open this again.")
             return False
@@ -252,6 +278,105 @@ class Window:
                     return
                 time.sleep(1)
 
+    # ---------------- Updates from GitHub ----------------
+    def toggle_auto(self):
+        self.auto_on = self.auto_var.get()
+        updater.save_prefs({"auto": self.auto_on})
+        log.info("Auto-update %s", "on - new versions install by themselves when no orders are open" if self.auto_on else "off")
+
+    def update_button(self):
+        """'Check now', or 'Update now' once a newer build has been found."""
+        info = self.update_info
+        if info and updater.newer(info) and updater.can_self_update():
+            msg = (f"Install build {info['build']} now?\n\nThe POS restarts (about 10-20 seconds) and tablets reconnect "
+                   "by themselves. Bills, menu and settings are kept.")
+            n = updater.open_orders()
+            if n:
+                msg += f"\n\n{n} open order(s) are saved and will still be there after the restart."
+            if messagebox.askyesno("Update Cafe POS", msg):
+                threading.Thread(target=self.install_update, daemon=True).start()
+        else:
+            threading.Thread(target=self.check_update, args=(True,), daemon=True).start()
+
+    def check_update(self, manual=False):
+        mine = updater.current()
+        try:
+            info = updater.latest()
+        except Exception as e:
+            self.set("upd", "amber", f"Build {mine['build']} ({mine['sha']}) - could not check for updates ({e})"[:140])
+            if manual:
+                log.warning("Update check failed: %s", e)
+            return None
+        self.update_info = info
+        when = time.strftime("%H:%M")
+        if not updater.newer(info, mine):
+            self.set("upd", "green", f"Build {mine['build']} ({mine['sha']}) - up to date, checked {when}")
+            self.q.put(("updbtn", "Check now"))
+            if manual:
+                log.info("Up to date (build %s)", mine["build"])
+        elif not updater.can_self_update():
+            self.set("upd", "amber", f"Build {info['build']} is on GitHub - running from source, update with: git pull")
+        else:
+            self.set("upd", "amber", f"New version: build {info['build']} - {info.get('message', '')}"[:140])
+            self.q.put(("updbtn", "Update now"))
+            if manual or not self.auto_on:
+                log.info("Update available: build %s (%s). Click 'Update now' to install.", info["build"], info.get("message", ""))
+        return info
+
+    def update_loop(self):
+        """Check GitHub soon after start, then every 30 min; with Auto-update on, install when no orders are open."""
+        self.wait(60)
+        while not self.closing:
+            info = self.check_update()
+            pause = 30 * 60
+            if info and updater.newer(info) and self.auto_on and updater.can_self_update():
+                n = updater.open_orders()
+                if n:
+                    if not self.waiting_logged:
+                        log.info("Build %s will install automatically once all %s open order(s) are billed", info["build"], n)
+                        self.waiting_logged = True
+                    pause = 5 * 60
+                else:
+                    log.info("Auto-update: installing build %s", info["build"])
+                    self.install_update()
+                    if self.installing:
+                        return
+            self.wait(pause)
+
+    def wait(self, seconds):
+        for _ in range(seconds):
+            if self.closing:
+                return
+            time.sleep(1)
+
+    def install_update(self):
+        if self.installing:
+            return
+        self.installing = True
+        info = self.update_info
+        try:
+            self.set("upd", "amber", f"Downloading build {info['build']}…")
+            updater.download(info, progress=lambda p: self.set("upd", "amber", f"Downloading build {info['build']}… {p}%"))
+            log.info("Build %s downloaded and verified - restarting into it", info["build"])
+            self.q.put(("restart", info))
+        except Exception as e:
+            log.error("Update failed: %s", e)
+            self.set("upd", "red", f"Update failed: {e}"[:140])
+            self.installing = False
+
+    def restart_into_update(self):
+        """Main thread: stop the server, swap in the new exe, start it and close this copy. Funnel stays on."""
+        self.closing = True
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+        try:
+            updater.swap(updater.NEW)
+        except OSError as e:
+            log.error("Could not replace CafePOS.exe (%s) - restarting the current version", e)
+        updater.relaunch(updater.current()["build"])
+        self.root.destroy()
+
     def on_close(self):
         if not messagebox.askyesno("Close the POS?", "Closing stops the POS on every tablet and turns off the public link.\n\nClose now?"):
             return
@@ -293,8 +418,16 @@ def main():
     log.setLevel(logging.INFO)
     log.addHandler(ui)
     log.addHandler(disk)
-    if win.start_server():
+    if updater.can_self_update():
+        updater.cleanup()
+    if os.environ.get("CAFEPOS_UPDATED_FROM"):
+        log.info("Updated from build %s to build %s - your data is unchanged", os.environ["CAFEPOS_UPDATED_FROM"],
+                 updater.current()["build"])
+    started = win.start_server()
+    os.environ.pop("CAFEPOS_UPDATED_FROM", None)  # don't hand it on to the next restart
+    if started:
         threading.Thread(target=win.watchdog, daemon=True).start()
+        threading.Thread(target=win.update_loop, daemon=True).start()
     root.mainloop()
 
 

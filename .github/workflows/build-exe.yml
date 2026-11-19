@@ -18,10 +18,29 @@ jobs:
           python-version: "3.12"
       - name: Self-check (GST maths + order flow)
         run: python app.py test
+      - name: Stamp the build number (the app compares it with version.json to find updates)
+        shell: bash
+        run: |
+          echo "{\"build\": ${{ github.run_number }}, \"sha\": \"${GITHUB_SHA::7}\"}" > build.json
+          cat build.json
       - name: Build one-file exe
         run: |
           pip install pyinstaller==6.11.1
-          pyinstaller --onefile --windowed --name CafePOS --add-data "index.html;." --add-data "menu.csv;." gui.py
+          pyinstaller --onefile --windowed --name CafePOS --add-data "index.html;." --add-data "menu.csv;." --add-data "build.json;." gui.py
+      - name: Write version.json (build, checksum, change note)
+        shell: bash
+        env:
+          MSG: ${{ github.event.head_commit.message }}
+        run: |
+          python - <<'EOF'
+          import hashlib, json, os
+          exe = open("dist/CafePOS.exe", "rb").read()
+          info = json.load(open("build.json"))
+          info.update(size=len(exe), sha256=hashlib.sha256(exe).hexdigest(),
+                      message=(os.environ.get("MSG") or "manual build").splitlines()[0][:100])
+          json.dump(info, open("dist/version.json", "w"))
+          print(info)
+          EOF
       - uses: actions/upload-artifact@v4
         with:
           name: CafePOS
@@ -33,3 +52,5 @@ jobs:
         run: |
           gh release view latest >/dev/null 2>&1 || gh release create latest --title "CafePOS.exe (latest build)" --notes "Built automatically from main. Download CafePOS.exe below."
           gh release upload latest dist/CafePOS.exe --clobber
+          # version.json last: apps only see the new build once its exe is fully uploaded
+          gh release upload latest dist/version.json --clobber
