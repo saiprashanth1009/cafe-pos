@@ -1,7 +1,7 @@
 """Restaurant POS server (dine-in / takeaway / delivery, KOT, GST billing, daily reports).
 Run: python app.py      Self-check: python app.py test      Windows control window: python gui.py
 Only needs Python 3 - no packages. All data lives in pos.db: back it up."""
-import base64, csv, hmac, json, logging, os, re, socket, sqlite3, sys, threading, time, unicodedata, webbrowser
+import base64, csv, hashlib, hmac, json, logging, os, re, secrets, socket, sqlite3, sys, threading, time, unicodedata, webbrowser
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +17,7 @@ DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or HERE) / "CafePOS" if FROZEN el
 DB = Path(os.environ.get("POS_DB") or DATA_DIR / "pos.db")
 PORT = int(os.environ.get("PORT") or 8000)
 log = logging.getLogger("pos")
+AFTER_CLOSE_DAY = None  # set by the CafePOS window (gui.py) to back up after "Close day"
 TYPES = ("dine_in", "takeaway", "delivery")
 PAYMENTS = ("Cash", "UPI", "Card")
 DEFAULT_SETTINGS = {"name": "Guns & Roses Café", "address": "Kondapur, Hyderabad", "phone": "", "gstin": "", "fssai": "",
@@ -24,7 +25,7 @@ DEFAULT_SETTINGS = {"name": "Guns & Roses Café", "address": "Kondapur, Hyderaba
                     "printer": "", "paper": "58",  # printer: "" = tablet's print dialog, else COM port of a thermal printer
                     "pin": os.environ.get("POS_PIN") or "1234",  # staff PIN; set POS_PIN when hosting so a fresh site never has 1234
                     "owner_pin": os.environ.get("POS_OWNER_PIN") or ""}  # blank = the staff PIN also has owner rights
-SECRET_SETTINGS = ("pin", "owner_pin")
+SECRET_SETTINGS = ("pin", "owner_pin", "pin_key")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL,
@@ -54,6 +55,12 @@ CREATE INDEX IF NOT EXISTS refunds_day ON refunds(day);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, at TEXT NOT NULL, day TEXT NOT NULL, role TEXT NOT NULL,
     device TEXT, ip TEXT, action TEXT NOT NULL, order_id INTEGER, amount INTEGER, reason TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS audit_day ON audit(day);
+-- named sign-ins: up to 3 owners + 5 staff, each with its own PIN, link (/profile=<slug>) and permissions
+CREATE TABLE IF NOT EXISTS profiles(id INTEGER PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('owner', 'staff')), pin_hash TEXT NOT NULL, perms TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1, created TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS profiles_slug ON profiles(slug) WHERE active = 1;
+CREATE UNIQUE INDEX IF NOT EXISTS profiles_pin ON profiles(pin_hash) WHERE active = 1;
 """
 
 
@@ -73,8 +80,15 @@ def init(con):
         for c in ("voided", "void_reason"):  # voided bills keep their number (GST) but leave the totals
             if c not in cols:
                 con.execute(f"ALTER TABLE orders ADD COLUMN {c} TEXT")
-        if "client_id" not in {r[1] for r in con.execute("PRAGMA table_info(kots)")}:
+        kcols = {r[1] for r in con.execute("PRAGMA table_info(kots)")}
+        if "client_id" not in kcols:
             con.execute("ALTER TABLE kots ADD COLUMN client_id TEXT")  # tablet's id for a KOT, so offline resends don't double up
+        if "ready_at" not in kcols:
+            con.execute("ALTER TABLE kots ADD COLUMN ready_at TEXT")  # kitchen's "recently ready" list (undo a mis-tap)
+        if "who" not in {r[1] for r in con.execute("PRAGMA table_info(audit)")}:
+            con.execute("ALTER TABLE audit ADD COLUMN who TEXT")  # profile name
+        # secret for PIN hashes, made once per database (profile PINs are never stored as typed)
+        con.execute("INSERT OR IGNORE INTO settings VALUES('pin_key', ?)", (secrets.token_hex(16),))
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS kots_client ON kots(client_id) WHERE client_id IS NOT NULL")
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS bill_no_per_day ON orders(day, day_no)")
         # bills from before split payments: one payment row for the whole total
@@ -111,13 +125,12 @@ def pct(amount, p):
 
 def totals(lines, discount_pct, tax_pct, discount_amt=0):
     """lines: [(price, qty)]. Discount is a % or a flat amount in paise. GST on the discounted amount,
-    split equally into CGST + SGST, grand total rounded to the nearest rupee."""
+    split equally into CGST + SGST. No round-off: the total is charged to the paisa (round_off stays 0;
+    bills from older versions keep theirs)."""
     subtotal = sum(p * q for p, q in lines)
     discount = discount_amt or pct(subtotal, discount_pct)
     cgst = sgst = pct(subtotal - discount, Decimal(str(tax_pct)) / 2)
-    raw = subtotal - discount + cgst + sgst
-    total = (raw + 50) // 100 * 100
-    return subtotal, discount, cgst, sgst, total - raw, total
+    return subtotal, discount, cgst, sgst, 0, subtotal - discount + cgst + sgst
 
 
 def check_pct(v):
@@ -156,14 +169,59 @@ def order_out(con, r):
     return o
 
 
-# ---- roles and the audit trail ----
-def role_for(s, given):
-    """'owner', 'staff' or None. Until an owner PIN is set, the one PIN does everything (as before)."""
-    g = (given or "").encode()
+# ---- profiles, permissions and the audit trail ----
+PERMS = {  # what a profile may do - the owner ticks these per profile on the Profiles screen
+    "orders": "Take orders and send them to the kitchen",
+    "bill": "Bill and print",
+    "kitchen": "Kitchen screen (mark ready, undo)",
+    "remove_item": "Remove items already sent to the kitchen",
+    "cancel": "Cancel whole orders",
+    "discount": "Give discounts",
+    "void_refund": "Void and refund bills",
+    "reports": "Reports, audit log and reprints",
+    "dashboard": "Dashboard",
+    "menu": "Edit the menu",
+    "settings": "Settings, printer and backup download",
+    "close_day": "Close the day",
+    "profiles": "Create and edit profiles (owners only)",
+}
+STAFF_DEFAULT = ["orders", "bill", "kitchen", "remove_item"]
+MAX_PROFILES = {"owner": 3, "staff": 5}
+LEGACY_STAFF = {"orders", "bill", "kitchen", "remove_item"}  # old staff PIN, until profiles are set up
+
+
+def pin_hash(s, pin):
+    return hmac.new(s["pin_key"].encode(), str(pin).encode(), hashlib.sha256).hexdigest()
+
+
+def profile_perms(r):
+    p = set(json.loads(r["perms"])) & set(PERMS)
+    return p | {"profiles"} if r["role"] == "owner" else p - {"profiles"}  # an owner can always manage profiles
+
+
+def profiles_on(con):
+    """Once an owner profile exists, only profile PINs sign in (the old shared PINs stop working)."""
+    return bool(con.execute("SELECT 1 FROM profiles WHERE active = 1 AND role = 'owner'").fetchone())
+
+
+def who_for(con, s, given, slug=None):
+    """Who a PIN signs in as: {role, name, slug, perms} or None. On a profile link (/profile=<slug>)
+    the PIN must be that profile's."""
+    if given:
+        r = con.execute("SELECT * FROM profiles WHERE pin_hash = ? AND active = 1", (pin_hash(s, given),)).fetchone()
+        if r:
+            if slug and slug != r["slug"]:
+                return None
+            return {"role": r["role"], "name": r["name"], "slug": r["slug"], "perms": profile_perms(r)}
+    if slug or profiles_on(con):
+        return None
+    g = (given or "").encode()  # before profiles: the old owner/staff PINs, exactly as in v3
     if s.get("owner_pin") and hmac.compare_digest(g, s["owner_pin"].encode()):
-        return "owner"
+        return {"role": "owner", "name": "Owner", "slug": None, "perms": set(PERMS)}
     if hmac.compare_digest(g, s["pin"].encode()):
-        return "staff" if s.get("owner_pin") else "owner"
+        if s.get("owner_pin"):
+            return {"role": "staff", "name": "Staff", "slug": None, "perms": set(LEGACY_STAFF)}
+        return {"role": "owner", "name": "Owner", "slug": None, "perms": set(PERMS)}
     return None
 
 
@@ -171,9 +229,14 @@ class Forbidden(Exception):
     pass
 
 
-def need_owner(d, what="This"):
-    if (d.get("_who") or {}).get("role", "owner") != "owner":  # no _who = called from code/tests
-        raise Forbidden(f"{what} needs the owner PIN")
+def can(d, perm):
+    w = d.get("_who")
+    return w is None or perm in w.get("perms", ())  # no _who = called from code/tests
+
+
+def need_perm(d, perm, what="This"):
+    if not can(d, perm):
+        raise Forbidden(f"{what} needs a profile that may: {PERMS[perm].lower()}")
 
 
 def need_reason(d):
@@ -185,11 +248,13 @@ def need_reason(d):
 
 def audit(con, d, action, order_id=None, amount=None, reason=None, detail=None, day=None):
     w = d.get("_who") or {}
-    con.execute("INSERT INTO audit(at, day, role, device, ip, action, order_id, amount, reason, detail) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (now(), day or business_day(con), w.get("role", "system"), w.get("device"), w.get("ip"), action, order_id,
-                 amount, reason, detail))
-    log.warning("AUDIT %s by %s%s%s%s%s", action, w.get("role", "system"),
+    if w.get("for") and w.get("for") != w.get("slug"):  # approved on someone else's tablet
+        detail = f"{detail + '; ' if detail else ''}approved for {w['for']}"
+    con.execute("INSERT INTO audit(at, day, role, who, device, ip, action, order_id, amount, reason, detail) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (now(), day or business_day(con), w.get("role", "system"), w.get("name"), w.get("device"), w.get("ip"),
+                 action, order_id, amount, reason, detail))
+    log.warning("AUDIT %s by %s%s%s%s%s", action, w.get("name") or w.get("role", "system"),
                 f" on {w['device']}" if w.get("device") else "", f", order #{order_id}" if order_id else "",
                 f", {rs(amount)}" if amount else "", f": {reason}" if reason else "")
 
@@ -201,22 +266,27 @@ def get_order(con, oid):
 # ---- GET routes (con, query) ----
 def state(con, q):
     s = settings(con)
+    w = q.get("_who") or {"role": "owner", "name": "Owner", "slug": None, "perms": set(PERMS)}
     return {"settings": {k: v for k, v in s.items() if k not in SECRET_SETTINGS},
-            "role": (q.get("_who") or {}).get("role", "owner"), "owner_pin_set": bool(s.get("owner_pin")),
+            "role": w["role"], "owner_pin_set": bool(s.get("owner_pin")), "profiles_on": profiles_on(con),
+            "me": {"name": w["name"], "role": w["role"], "slug": w["slug"], "perms": sorted(w["perms"])},
             "items": [dict(r) for r in con.execute(
                 "SELECT id, name, category, price FROM items WHERE active = 1 ORDER BY id")],  # menu.csv order
             "orders": [order_out(con, r) for r in con.execute("SELECT * FROM orders WHERE status = 'open' ORDER BY id")]}
 
 
 def kitchen(con, q):
-    kots = []
-    for k in con.execute(
-            "SELECT k.id, k.created, k.note, k.order_id, o.type, o.table_no, o.customer FROM kots k "
-            "JOIN orders o ON o.id = k.order_id WHERE k.status = 'new' AND o.status != 'cancelled' ORDER BY k.id"):
-        lines = [dict(l) for l in con.execute("SELECT name, qty FROM lines WHERE kot_id = ? ORDER BY id", (k["id"],))]
-        if lines:  # every line removed -> nothing left to cook
-            kots.append({**dict(k), "lines": lines})
-    return kots
+    def tickets(where, order, limit=""):
+        out = []
+        for k in con.execute(
+                "SELECT k.id, k.created, k.ready_at, k.note, k.order_id, o.type, o.table_no, o.customer FROM kots k "
+                f"JOIN orders o ON o.id = k.order_id WHERE {where} AND o.status != 'cancelled' ORDER BY {order} {limit}"):
+            lines = [dict(l) for l in con.execute("SELECT name, qty FROM lines WHERE kot_id = ? ORDER BY id", (k["id"],))]
+            if lines:  # every line removed -> nothing left to cook
+                out.append({**dict(k), "lines": lines})
+        return out
+    return {"kots": tickets("k.status = 'new'", "k.id"),
+            "recent": tickets("k.status = 'ready'", "COALESCE(k.ready_at, k.created) DESC, k.id DESC", "LIMIT 10")}
 
 
 def report(con, q):
@@ -430,8 +500,81 @@ def cancel_order(con, d):
 
 
 def kot_ready(con, d):
-    con.execute("UPDATE kots SET status = 'ready' WHERE id = ?", (int(d["id"]),))
+    con.execute("UPDATE kots SET status = 'ready', ready_at = ? WHERE id = ?", (now(), int(d["id"])))
     log.info("KOT %s ready", d["id"])
+    return {"ok": True}
+
+
+def kot_undo(con, d):
+    """Kitchen tapped "ready" by mistake: the ticket goes back to cooking."""
+    if not con.execute("UPDATE kots SET status = 'new', ready_at = NULL WHERE id = ? AND status = 'ready'",
+                       (int(d["id"]),)).rowcount:
+        raise ValueError("ticket not found or already back in the kitchen")
+    log.info("KOT %s back to cooking (by %s)", d["id"], (d.get("_who") or {}).get("name", "?"))
+    return {"ok": True}
+
+
+def list_profiles(con, q):
+    rows = con.execute("SELECT id, name, slug, role, perms, created FROM profiles WHERE active = 1 ORDER BY role, id")
+    return {"profiles": [{**dict(r), "perms": sorted(profile_perms(r))} for r in rows],
+            "perms": PERMS, "staff_default": STAFF_DEFAULT, "max": MAX_PROFILES}
+
+
+def save_profile(con, d):
+    """Create or change a profile. Owners only. PINs are unique, 6+ digits, and stored hashed."""
+    s, pid = settings(con), int(d["id"]) if d.get("id") else None
+    name = re.sub(r"\s+", " ", str(d.get("name") or "")).strip()[:30]
+    role = d.get("role")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]*", name or "-"):
+        raise ValueError("name: letters and numbers only (e.g. Sai)")
+    if role not in MAX_PROFILES:
+        raise ValueError("pick owner or staff")
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") + "_" + role
+    perms = sorted((set(d.get("perms") or []) & set(PERMS)) | ({"profiles"} if role == "owner" else set()))
+    if role == "staff":
+        perms = [p for p in perms if p != "profiles"]
+    pin = str(d.get("pin") or "")
+    if pin and not (pin.isdigit() and 6 <= len(pin) <= 12):
+        raise ValueError("PIN must be 6 to 12 digits")
+    if not pid and not pin:
+        raise ValueError("a new profile needs a PIN")
+    old = con.execute("SELECT * FROM profiles WHERE id = ? AND active = 1", (pid,)).fetchone() if pid else None
+    if pid and not old:
+        raise ValueError("profile not found - refresh")
+    count = con.execute("SELECT COUNT(*) FROM profiles WHERE active = 1 AND role = ? AND id != ?", (role, pid or 0)).fetchone()[0]
+    if count >= MAX_PROFILES[role]:
+        raise ValueError(f"at most {MAX_PROFILES[role]} {role} profiles")
+    if old and old["role"] == "owner" and role != "owner" and not con.execute(
+            "SELECT 1 FROM profiles WHERE active = 1 AND role = 'owner' AND id != ?", (pid,)).fetchone():
+        raise ValueError("keep at least one owner profile")
+    if con.execute("SELECT 1 FROM profiles WHERE active = 1 AND slug = ? AND id != ?", (slug, pid or 0)).fetchone():
+        raise ValueError(f"there is already a {role} called {name}")
+    if pin and con.execute("SELECT 1 FROM profiles WHERE active = 1 AND pin_hash = ? AND id != ?",
+                           (pin_hash(s, pin), pid or 0)).fetchone():
+        raise ValueError("that PIN is already used by another profile - pick a different one")
+    if old:
+        con.execute("UPDATE profiles SET name = ?, slug = ?, role = ?, perms = ?" + (", pin_hash = ?" if pin else "")
+                    + " WHERE id = ?", (name, slug, role, json.dumps(perms), *([pin_hash(s, pin)] if pin else []), pid))
+    else:
+        pid = con.execute("INSERT INTO profiles(name, slug, role, pin_hash, perms, created) VALUES(?, ?, ?, ?, ?, ?)",
+                          (name, slug, role, pin_hash(s, pin), json.dumps(perms), now())).lastrowid
+    audit(con, d, "profile_save", detail=f"{name} ({role})" + (" - changed" if old else " - created")
+          + (", new PIN" if pin and old else "") + ": " + ", ".join(perms))
+    return {"ok": True, "id": pid, "slug": slug}
+
+
+def delete_profile(con, d):
+    r = con.execute("SELECT * FROM profiles WHERE id = ? AND active = 1", (int(d["id"]),)).fetchone()
+    if not r:
+        raise ValueError("profile not found - refresh")
+    if r["slug"] == (d.get("_who") or {}).get("slug"):
+        raise ValueError("you can't delete the profile you are signed in with")
+    others = con.execute("SELECT COUNT(*) FROM profiles WHERE active = 1 AND id != ?", (r["id"],)).fetchone()[0]
+    if r["role"] == "owner" and others and not con.execute(
+            "SELECT 1 FROM profiles WHERE active = 1 AND role = 'owner' AND id != ?", (r["id"],)).fetchone():
+        raise ValueError("keep at least one owner profile")
+    con.execute("UPDATE profiles SET active = 0 WHERE id = ?", (r["id"],))  # kept for the audit history
+    audit(con, d, "profile_delete", detail=f"{r['name']} ({r['role']})")
     return {"ok": True}
 
 
@@ -477,7 +620,7 @@ def bill_order(con, d):
         if not 0 < amt <= sum(p * q for p, q in lines):
             raise ValueError("rupee discount must be more than 0 and not more than the bill")
     if amt or Decimal(disc):
-        need_owner(d, "A discount")
+        need_perm(d, "discount", "A discount")
     sub, dis, cgst, sgst, ro, total = totals(lines, disc, tax_pct, amt)
     pays = parse_payments(d, total)
     payment = "+".join(dict.fromkeys(m for m, _ in pays)) or "Cash"  # "Cash", or "Cash+UPI" for a split
@@ -565,6 +708,8 @@ def close_day(con, d):
     r = report(con, {"day": [day]})
     audit(con, d, "close_day", amount=r["net"], detail=f"{day}: {r['count']} bills, next day {nxt}", day=day)
     log.info("DAY CLOSED %s: %d bills, net %s. Next business day: %s", day, r["count"], rs(r["net"]), nxt)
+    if AFTER_CLOSE_DAY:  # e.g. Google Drive backup; a few seconds later, once this transaction is saved
+        threading.Timer(5, AFTER_CLOSE_DAY).start()
     return {"report": r, "next": nxt}
 
 
@@ -723,7 +868,9 @@ def day_ticket(r, s, w):
     t.line(("Day still open" if r["open"] else "Day closed") + " - printed " + datetime.now().strftime("%d/%m %I:%M %p"), center=True)
     t.rule().row("Bills", r["count"]).row("Cancelled orders", r["cancelled"]).rule()
     t.row("Gross", amt(sm["subtotal"])).row("Discounts", amt(-sm["discount"]))
-    t.row(f"CGST @ {h}%", amt(sm["cgst"])).row(f"SGST @ {h}%", amt(sm["sgst"])).row("Round off", amt(sm["round_off"]))
+    t.row(f"CGST @ {h}%", amt(sm["cgst"])).row(f"SGST @ {h}%", amt(sm["sgst"]))
+    if sm["round_off"]:  # only bills from before v4 have a round-off
+        t.row("Round off", amt(sm["round_off"]))
     if r.get("voided", {}).get("count"):
         t.row(f"Voided bills ({r['voided']['count']})", amt(r["voided"]["total"]))
     if r.get("refunds"):
@@ -773,7 +920,8 @@ def print_job(con, d):
         b = order_out(con, r)
         data, what = bill_ticket(b, s, w), f"bill {b['bill_label']}"
     elif d.get("day"):
-        need_owner(d, "The day report")
+        if not (can(d, "reports") or can(d, "close_day")):
+            raise Forbidden("The day report needs a profile that may see reports")
         data, what = day_ticket(report(con, {"day": [str(d["day"])]}), s, w), f"day report {d['day']}"
     elif d.get("test"):
         t = header(Ticket(w), s).line("Printer test", bold=True, center=True).rule()
@@ -788,15 +936,20 @@ def print_job(con, d):
 
 
 GET = {"/api/state": state, "/api/kitchen": kitchen, "/api/report": report, "/api/backup": backup,
-       "/api/printers": printer_ports, "/api/audit": audit_log, "/api/dashboard": dashboard}
+       "/api/printers": printer_ports, "/api/audit": audit_log, "/api/dashboard": dashboard, "/api/profiles": list_profiles}
 POST = {"/api/items": save_item, "/api/items/delete": delete_item, "/api/settings": save_settings,
         "/api/orders/new": new_order, "/api/orders/kot": send_kot, "/api/orders/remove_line": remove_line,
         "/api/orders/cancel": cancel_order, "/api/orders/bill": bill_order, "/api/kots/ready": kot_ready,
-        "/api/day/close": close_day, "/api/print": print_job, "/api/bills/void": void_bill, "/api/bills/refund": refund_bill}
-# staff take orders, bill and run the kitchen; everything else needs the owner PIN (discounts: checked in bill_order)
-OWNER_ONLY = {"/api/report", "/api/backup", "/api/printers", "/api/audit", "/api/dashboard", "/api/items",
-              "/api/items/delete", "/api/settings", "/api/orders/remove_line", "/api/orders/cancel", "/api/day/close",
-              "/api/bills/void", "/api/bills/refund"}
+        "/api/day/close": close_day, "/api/print": print_job, "/api/bills/void": void_bill, "/api/bills/refund": refund_bill,
+        "/api/kots/undo": kot_undo, "/api/profiles/save": save_profile, "/api/profiles/delete": delete_profile}
+# what each request needs (discounts and the day report are checked inside bill_order / print_job)
+ROUTE_PERMS = {"/api/kitchen": "kitchen", "/api/report": "reports", "/api/audit": "reports", "/api/backup": "settings",
+               "/api/printers": "settings", "/api/dashboard": "dashboard", "/api/items": "menu", "/api/items/delete": "menu",
+               "/api/settings": "settings", "/api/orders/new": "orders", "/api/orders/kot": "orders",
+               "/api/orders/remove_line": "remove_item", "/api/orders/cancel": "cancel", "/api/orders/bill": "bill",
+               "/api/kots/ready": "kitchen", "/api/kots/undo": "kitchen", "/api/day/close": "close_day",
+               "/api/bills/void": "void_refund", "/api/bills/refund": "void_refund", "/api/profiles": "profiles",
+               "/api/profiles/save": "profiles", "/api/profiles/delete": "profiles"}
 
 
 # ponytail: one global lockout, so guessing a 6-digit PIN online takes months; an attacker can also keep
@@ -821,7 +974,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urlparse(self.path)
-        if u.path == "/":
+        if u.path == "/" or u.path.startswith("/profile="):  # each profile has its own link to save
             return self.send((RES / "index.html").read_bytes(), ctype="text/html; charset=utf-8")
         self.api(GET.get(u.path), parse_qs(u.query))
 
@@ -841,8 +994,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send({"error": "Too many wrong PINs. Wait a minute and try again."}, 429)
         con = db()
         try:
-            role = role_for(settings(con), self.headers.get("X-Pin", ""))
-            if not role:
+            slug = self.headers.get("X-Profile", "")[:60] or None
+            who = who_for(con, settings(con), self.headers.get("X-Pin", ""), slug)
+            if not who:
                 LOCK["fails"] += 1
                 if self.headers.get("X-Pin"):  # a blank PIN is just a tablet's first visit
                     # behind Tailscale Funnel every visitor is 127.0.0.1; the proxy passes the real one along
@@ -854,21 +1008,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send({"error": "Wrong PIN"}, 401)
             LOCK["fails"] = 0
             path = urlparse(self.path).path
-            if path in OWNER_ONLY and role != "owner":
-                return self.send({"error": "Only the owner can do this - ask the owner to enter the owner PIN.",
-                                  "owner": True}, 403)
-            arg["_who"] = {"role": role, "device": self.headers.get("X-Device", "")[:40] or None,
+            perm = ROUTE_PERMS.get(path)
+            if perm and perm not in who["perms"]:
+                return self.send({"error": f"{who['name']} can't do this ({PERMS[perm].lower()}). "
+                                           "Ask an owner to approve it or to change your profile.", "perm": perm}, 403)
+            arg["_who"] = {**who, "device": self.headers.get("X-Device", "")[:40] or None,
+                           "for": self.headers.get("X-For", "")[:60] or None,
                            "ip": (self.headers.get("X-Forwarded-For") or self.client_address[0])[:60]}
             with con:  # one transaction per request, rolled back on any error
                 out = route(con, arg)
             self.send(out, ctype="application/octet-stream" if isinstance(out, bytes) else "application/json")
         except Forbidden as e:
-            self.send({"error": f"{e} - ask the owner to enter it.", "owner": True}, 403)
+            self.send({"error": f"{e} - ask an owner to approve it.", "perm": True}, 403)
         except PrinterError as e:
             log.error("Print failed: %s", e)
             self.send({"error": str(e)}, 503)
-        except sqlite3.IntegrityError:
-            self.send({"error": "That table already has an open order. Refresh and try again."}, 409)
+        except sqlite3.IntegrityError as e:
+            self.send({"error": "That PIN or name is already used." if "profiles" in str(e)
+                       else "That table already has an open order. Refresh and try again."}, 409)
         except (ValueError, KeyError, TypeError, InvalidOperation) as e:
             log.warning("Rejected %s: %s", self.path, e)
             self.send({"error": f"Invalid input: {e}"}, 400)
@@ -887,11 +1044,11 @@ def lan_ips():
 
 def selftest():
     two = [(10000, 2), (4550, 1)]
-    assert totals(two, 0, 5) == (24550, 0, 614, 614, 22, 25800)       # 613.75 -> 614 each, round to ₹258
-    assert totals(two, 10, 5) == (24550, 2455, 552, 552, 1, 23200)    # GST on discounted amount
-    assert totals(two, 0, 18) == (24550, 0, 2210, 2210, 30, 29000)
-    assert totals([(4949, 1)], 0, 0) == (4949, 0, 0, 0, -49, 4900)    # rounds down too
-    assert totals(two, 0, 5, 5000) == (24550, 5000, 489, 489, -28, 20500)  # flat ₹50 off, GST on the rest
+    assert totals(two, 0, 5) == (24550, 0, 614, 614, 0, 25778)        # 613.75 -> 614 each, no round-off
+    assert totals(two, 10, 5) == (24550, 2455, 552, 552, 0, 23199)    # GST on discounted amount
+    assert totals(two, 0, 18) == (24550, 0, 2210, 2210, 0, 28970)
+    assert totals([(4949, 1)], 0, 0) == (4949, 0, 0, 0, 0, 4949)
+    assert totals(two, 0, 5, 5000) == (24550, 5000, 489, 489, 0, 20528)  # flat ₹50 off, GST on the rest
     assert paise("249.50") == 24950 and paise("0.005") == 1
 
     con = db(":memory:")
@@ -907,10 +1064,10 @@ def selftest():
         except sqlite3.IntegrityError:
             pass
         send_kot(con, {"order_id": oid, "lines": [{"id": pid, "qty": 2}], "note": "less spicy"})
-        k = kitchen(con, {})[0]
+        k = kitchen(con, {})["kots"][0]
         assert k["lines"] == [{"name": "Paneer Tikka", "qty": 2}] and k["note"] == "less spicy"
         b = bill_order(con, {"order_id": oid, "payment": "UPI", "discount_pct": 0})
-        assert (b["bill_no"], b["subtotal"], b["cgst"], b["round_off"], b["total"]) == (1, 49900, 1248, 4, 52400)
+        assert (b["bill_no"], b["subtotal"], b["cgst"], b["round_off"], b["total"]) == (1, 49900, 1248, 0, 52396)
         assert b["day_no"] == 1 and b["bill_label"] == bill_label(b["day"], 1)
         try:
             bill_order(con, {"order_id": oid, "payment": "UPI"})
@@ -920,7 +1077,7 @@ def selftest():
         assert b["day"] == business_day(con) == date.today().isoformat()
         o2 = new_order(con, {"type": "dine_in", "table_no": 1})["id"]  # table is free again after billing
         r = report(con, {"day": [b["day"]]})
-        assert r["count"] == 1 and r["by_payment"] == {"UPI": 52400} and r["items"] == [["Paneer Tikka", 2, 49900]]
+        assert r["count"] == 1 and r["by_payment"] == {"UPI": 52396} and r["items"] == [["Paneer Tikka", 2, 49900]]
         assert r["open"]
         try:
             close_day(con, {"day": b["day"]})
@@ -977,12 +1134,13 @@ def selftest():
         except ValueError:
             pass
     # ---- v3: owner/staff PINs, audit trail, split bills & payments, voids, refunds, offline resends, dashboard ----
-    staff, owner = {"_who": {"role": "staff", "device": "T1"}}, {"_who": {"role": "owner", "device": "Counter"}}
+    staff = {"_who": {"role": "staff", "name": "Staff", "slug": None, "device": "T1", "perms": set(LEGACY_STAFF)}}
+    owner = {"_who": {"role": "owner", "name": "Owner", "slug": None, "device": "Counter", "perms": set(PERMS)}}
     with con:
         save_settings(con, {**owner, "owner_pin": "987654"})
         s = settings(con)
-        assert role_for(s, "987654") == "owner" and role_for(s, "1234") == "staff" and role_for(s, "1") is None
-        assert role_for({"pin": "1234", "owner_pin": ""}, "1234") == "owner"  # no owner PIN yet: works as before
+        role = lambda pin: (who_for(con, s, pin) or {}).get("role")
+        assert role("987654") == "owner" and role("1234") == "staff" and role("1") is None
         try:
             save_settings(con, {"pin": "555555", "owner_pin": "555555"})
             raise AssertionError("owner PIN same as staff PIN")
@@ -1012,9 +1170,9 @@ def selftest():
         except ValueError:
             pass
         part = bill_order(con, {**staff, "order_id": oid4, "line_ids": paneer,
-                                "payments": [{"method": "Cash", "amount": "500"}, {"method": "UPI", "amount": "286"}]})
-        assert part["total"] == 78600 and part["table_no"] == 2 and part["payment"] == "Cash+UPI"
-        assert part["payments"] == [{"method": "Cash", "amount": 50000}, {"method": "UPI", "amount": 28600}]
+                                "payments": [{"method": "Cash", "amount": "500"}, {"method": "UPI", "amount": "285.92"}]})
+        assert part["total"] == 78592 and part["table_no"] == 2 and part["payment"] == "Cash+UPI"
+        assert part["payments"] == [{"method": "Cash", "amount": 50000}, {"method": "UPI", "amount": 28592}]
         rest = get_order(con, oid4)
         assert rest["status"] == "open" and [l["name"] for l in rest["lines"]] == ["Water"]
         tk = re.sub(rb"\x1b[aE@d].?|\x1d[!V].?", b"", bill_ticket(part, settings(con), 32)).decode()
@@ -1033,7 +1191,7 @@ def selftest():
         v = void_bill(con, {**owner, "order_id": w["id"], "reason": "wrong table", "reopen": True})
         ro_ = get_order(con, v["reopened"])
         assert ro_["status"] == "open" and ro_["table_no"] == 2 and [(l["name"], l["qty"]) for l in ro_["lines"]] == [("Water", 3)]
-        assert not any("Reopened" in (k["note"] or "") for k in kitchen(con, {}))  # not cooked twice
+        assert not any("Reopened" in (k["note"] or "") for k in kitchen(con, {})["kots"])  # not cooked twice
         assert "VOID" in bill_ticket(get_order(con, w["id"]), settings(con), 32).decode("ascii", "ignore")
         try:
             void_bill(con, {**owner, "order_id": w["id"], "reason": "again"})
@@ -1049,7 +1207,7 @@ def selftest():
             pass
         r = report(con, {"day": [business_day(con)]})
         assert r["voided"] == {"count": 1, "total": 6300} and r["refunds"] == 10000 and r["net"] == r["sums"]["total"] - 10000
-        assert r["by_payment"]["UPI"] == 28600  # the voided bill's UPI is not counted
+        assert r["by_payment"]["UPI"] == 28592  # the voided bill's UPI is not counted
         acts = {a["action"] for a in audit_log(con, {})}
         assert {"settings", "discount", "void_bill", "refund", "remove_item"} <= acts, acts
         assert all(a["role"] for a in audit_log(con, {}))
@@ -1057,10 +1215,77 @@ def selftest():
         assert dsh["payments"] == r["by_payment"] and dsh["today"]["net"] == r["net"] and dsh["today"]["bills"] == r["count"]
         assert dsh["top_items"][0][0] == "Paneer Tikka" and len(dsh["week"]) == 7 and dsh["hours"]
         assert b"Refunds" in day_ticket(r, settings(con), 32)
+    # ---- v4: profiles (3 owners / 5 staff), per-profile permissions and links, kitchen undo ----
+    with con:
+        s = settings(con)
+        assert not profiles_on(con) and who_for(con, s, "987654")["name"] == "Owner"  # old PINs until profiles exist
+        tej = save_profile(con, {**owner, "name": "Tej", "role": "staff", "pin": "111111", "perms": ["orders", "remove_item", "profiles"]})
+        assert tej["slug"] == "tej_staff" and not profiles_on(con)  # a staff profile alone doesn't switch over
+        sai = save_profile(con, {**owner, "name": "Sai", "role": "owner", "pin": "222222", "perms": ["reports"]})
+        assert sai["slug"] == "sai_owner" and profiles_on(con)
+        assert who_for(con, s, "987654") is None and who_for(con, s, "1234") is None  # old shared PINs stop
+        t = who_for(con, s, "111111")
+        assert t["name"] == "Tej" and t["perms"] == {"orders", "remove_item"}  # staff never get "profiles"
+        assert who_for(con, s, "222222")["perms"] == {"reports", "profiles"}   # owners always can manage profiles
+        assert who_for(con, s, "111111", "tej_staff") and who_for(con, s, "111111", "sai_owner") is None  # link = that profile
+        for bad in ({"name": "Tej", "role": "staff", "pin": "333333"},   # same name + role
+                    {"name": "Ravi", "role": "staff", "pin": "111111"},  # PIN in use
+                    {"name": "Ravi", "role": "staff", "pin": "12"},      # too short
+                    {"name": "Ravi", "role": "staff"},                   # no PIN
+                    {"name": "<b>", "role": "staff", "pin": "444444"}):
+            try:
+                save_profile(con, {**owner, **bad})
+                raise AssertionError(f"accepted {bad}")
+            except ValueError:
+                pass
+        for i in range(2):
+            save_profile(con, {**owner, "name": f"Own{i}", "role": "owner", "pin": f"55555{i}"})
+        try:
+            save_profile(con, {**owner, "name": "Own3", "role": "owner", "pin": "555559"})
+            raise AssertionError("4th owner")
+        except ValueError:
+            pass
+        for i in range(4):
+            save_profile(con, {**owner, "name": f"Waiter{i}", "role": "staff", "pin": f"66666{i}"})
+        try:
+            save_profile(con, {**owner, "name": "Waiter9", "role": "staff", "pin": "666669"})
+            raise AssertionError("6th staff")
+        except ValueError:
+            pass
+        lst = list_profiles(con, {})
+        assert len(lst["profiles"]) == 8 and all("pin_hash" not in x for x in lst["profiles"])
+        me = {"_who": {**who_for(con, s, "222222"), "device": "Counter"}}
+        try:
+            delete_profile(con, {**me, "id": sai["id"]})
+            raise AssertionError("deleted own profile")
+        except ValueError:
+            pass
+        delete_profile(con, {**me, "id": tej["id"]})
+        assert who_for(con, s, "111111") is None
+        save_profile(con, {**me, "id": sai["id"], "name": "Sai", "role": "owner", "pin": "", "perms": list(PERMS)})
+        assert who_for(con, s, "222222")["perms"] == set(PERMS)  # blank PIN keeps the old one
+        # staff profile removes a cooking item with its own PIN; the audit log names them
+        w0 = {"_who": {**who_for(con, s, "666660"), "device": "Floor"}}
+        k = send_kot(con, {**w0, "order": {"type": "takeaway"}, "lines": [{"id": pid, "qty": 2}]})
+        line = get_order(con, k["order_id"])["lines"][0]
+        remove_line(con, {**w0, "line_id": line["id"], "reason": "customer changed mind"})
+        a = audit_log(con, {})[0]
+        assert (a["action"], a["who"], a["role"], a["device"]) == ("remove_item", "Waiter0", "staff", "Floor"), a
+        # kitchen: last 10 ready tickets, and undo a mis-tap
+        k2 = send_kot(con, {**w0, "order": {"type": "takeaway"}, "lines": [{"id": pid, "qty": 1}]})
+        kot_ready(con, {"id": k2["id"]})
+        kd = kitchen(con, {})
+        assert kd["recent"][0]["id"] == k2["id"] and kd["recent"][0]["ready_at"] and len(kd["recent"]) <= 10
+        assert all(x["id"] != k2["id"] for x in kd["kots"])
+        kot_undo(con, {"id": k2["id"]})
+        assert any(x["id"] == k2["id"] for x in kitchen(con, {})["kots"])
+        st = state(con, me)
+        assert st["me"]["name"] == "Sai" and st["me"]["slug"] == "sai_owner" and st["profiles_on"]
+        assert "pin_key" not in st["settings"]
     snap = sqlite3.connect(":memory:")
     if hasattr(snap, "deserialize"):  # Python 3.11+
         snap.deserialize(backup(con, {}))
-        assert snap.execute("SELECT total FROM orders WHERE status = 'billed' ORDER BY id").fetchone()[0] == 52400  # backup holds the bill
+        assert snap.execute("SELECT total FROM orders WHERE status = 'billed' ORDER BY id").fetchone()[0] == 52396  # backup holds the bill
     print("ok")
 
 

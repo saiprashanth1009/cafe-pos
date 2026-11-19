@@ -3,11 +3,12 @@ publishes the public link with Tailscale Funnel, and shows a live log.
 Dev run: python gui.py      Exe build: see .github/workflows/build-exe.yml"""
 import json, logging, os, queue, re, shutil, subprocess, sys, threading, time, urllib.request, webbrowser
 import tkinter as tk
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
 
 import app
+import gdrive
 import updater
 
 PORT = app.PORT
@@ -43,7 +44,7 @@ class Window:
         self.update_info, self.installing, self.waiting_logged = None, False, False
         self.auto_on = updater.load_prefs()["auto"] and updater.can_self_update()
         root.title("Guns & Roses Café POS")
-        root.geometry("900x600")
+        root.geometry("940x660")
         root.minsize(680, 440)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -61,6 +62,7 @@ class Window:
                  ("lan", "Same Wi-Fi", [("Copy", lambda: self.copy("lan"))]),
                  ("ts", "Tailscale", [("Sign in", None)]),  # action button, shown only when Tailscale needs you
                  ("db", "Database", [("Open folder", lambda: os.startfile(app.DB.parent))]),
+                 ("gd", "Google Drive", [("Backup now", self.gdrive_now), ("Setup…", self.gdrive_setup)]),
                  ("upd", "Updates", [("Check now", self.update_button)])]
         for i, (key, title, buttons) in enumerate(specs, start=2):
             dot = tk.Label(top, text="●", fg=COLORS["grey"], font=("Segoe UI", 13))
@@ -137,6 +139,8 @@ class Window:
                     b.grid()
                 else:
                     b.grid_remove()
+            elif msg[0] == "call":
+                msg[1]()
             elif msg[0] == "updbtn":
                 self.rows["upd"]["btns"][0].configure(text=msg[1])
             elif msg[0] == "restart":
@@ -288,6 +292,159 @@ class Window:
         self.auto_on = self.auto_var.get()
         updater.save_prefs({"auto": self.auto_on})
         log.info("Auto-update %s", "on - new versions install by themselves when no orders are open" if self.auto_on else "off")
+
+    # ---------------- Google Drive backup ----------------
+    def gdrive_status(self):
+        c = gdrive.load()
+        if not c["refresh_token"]:
+            self.set("gd", "grey", "Not set up - press Setup… to connect a Google account" if not c["client_id"]
+                     else "Not connected - press Setup… → Connect Google account")
+            return
+        auto = f"every {c['every_hours']} h" if c["every_hours"] else "automatic off"
+        last = (f"last backup {datetime.fromisoformat(c['last_ok']).strftime('%d %b %H:%M')}" if c["last_ok"]
+                else "no backup yet")
+        if c["last_error"]:
+            self.set("gd", "red", f"{c['email']} - backup failed: {c['last_error']}"[:160])
+        else:
+            self.set("gd", "green", f"{c['email']} - {last}, {auto}" + (", and after Close day" if c["after_close"] else ""))
+
+    def gdrive_now(self, quiet=False):
+        def run():
+            self.set("gd", "amber", "Backing up to Google Drive…")
+            try:
+                gdrive.backup_now(log=log)
+            except Exception as e:
+                log.error("Google Drive backup failed: %s", e)
+            self.gdrive_status()
+        threading.Thread(target=run, daemon=True).start()
+
+    def gdrive_loop(self):
+        """Automatic backups: checks every minute whether one is due (Setup → Automatic backup)."""
+        self.wait(30)
+        while not self.closing:
+            try:
+                if gdrive.due(gdrive.load()) and not gdrive.LOCK.locked():
+                    log.info("Automatic Google Drive backup")
+                    self.gdrive_now()
+            except Exception as e:
+                log.error("Google Drive check failed: %s", e)
+            self.wait(60)
+
+    def after_close_day(self):
+        c = gdrive.load()
+        if c["refresh_token"] and c["after_close"]:
+            log.info("Day closed - backing up to Google Drive")
+            self.gdrive_now()
+
+    def gdrive_setup(self):
+        c = gdrive.load()
+        w = tk.Toplevel(self.root)
+        w.title("Google Drive backup")
+        w.transient(self.root)
+        w.resizable(False, False)
+        f = ttk.Frame(w, padding=14)
+        f.pack(fill="both", expand=True)
+        f.columnconfigure(1, weight=1)
+        r = 0
+
+        def head(text):
+            nonlocal r
+            ttk.Label(f, text=text, font=("Segoe UI", 10, "bold")).grid(row=r, column=0, columnspan=3, sticky="w", pady=(10, 2))
+            r += 1
+
+        head("1. Google sign-in app (one time)")
+        ttk.Label(f, foreground=COLORS["grey"], wraplength=520, justify="left",
+                  text="Google needs a free 'Desktop app' sign-in made in your Google Cloud account. Steps are in the "
+                       "README under 'Google Drive backup'. Paste its Client ID and Client secret here.").grid(
+            row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+        cid, sec = tk.StringVar(value=c["client_id"]), tk.StringVar(value=c["client_secret"])
+        for label, var, show in (("Client ID", cid, ""), ("Client secret", sec, "•")):
+            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Entry(f, textvariable=var, width=58, show=show).grid(row=r, column=1, columnspan=2, sticky="ew", pady=2)
+            r += 1
+        ttk.Button(f, text="Open setup steps", command=lambda: webbrowser.open(
+            f"https://github.com/{updater.REPO}#google-drive-backup")).grid(row=r, column=1, sticky="w", pady=2)
+        r += 1
+
+        head("2. Google account")
+        acct = tk.StringVar(value=c["email"] or "Not connected")
+        ttk.Label(f, textvariable=acct).grid(row=r, column=0, columnspan=2, sticky="w")
+        btns = ttk.Frame(f)
+        btns.grid(row=r, column=2, sticky="e")
+        r += 1
+
+        def keep_fields():
+            c.update(client_id=cid.get().strip(), client_secret=sec.get().strip())
+
+        def do_connect():
+            keep_fields()
+            gdrive.save(c)
+            acct.set("Waiting for Google sign-in in the browser… pick the café's Google account")
+
+            def run():
+                try:
+                    email = gdrive.connect(c)
+                    log.info("Google Drive connected: %s", email)
+                    self.q.put(("call", lambda: acct.set(f"Connected: {email}")))
+                except Exception as e:
+                    log.error("Google sign-in failed: %s", e)
+                    self.q.put(("call", lambda: acct.set(f"Not connected - {e}"[:90])))
+                self.gdrive_status()
+            threading.Thread(target=run, daemon=True).start()
+
+        def do_disconnect():
+            if messagebox.askyesno("Disconnect Google Drive?", "Stop backing up to this Google account?\n"
+                                   "Backups already in Drive stay there.", parent=w):
+                gdrive.disconnect(c)
+                acct.set("Not connected")
+                log.info("Google Drive disconnected")
+                self.gdrive_status()
+        ttk.Button(btns, text="Connect Google account", command=do_connect).pack(side="left", padx=2)
+        ttk.Button(btns, text="Disconnect", command=do_disconnect).pack(side="left", padx=2)
+
+        head("3. What to back up")
+        picks = {}
+        for k, label in gdrive.KINDS.items():
+            picks[k] = tk.BooleanVar(value=c["files"].get(k, False))
+            ttk.Checkbutton(f, text=label, variable=picks[k]).grid(row=r, column=0, columnspan=3, sticky="w")
+            r += 1
+
+        head("4. Automatic backup")
+        every = {"Off": 0, "Every 6 hours": 6, "Every 12 hours": 12, "Once a day": 24}
+        when = tk.StringVar(value=next((k for k, v in every.items() if v == c["every_hours"]), "Once a day"))
+        ttk.Combobox(f, textvariable=when, values=list(every), state="readonly", width=18).grid(row=r, column=0, sticky="w")
+        after = tk.BooleanVar(value=c["after_close"])
+        ttk.Checkbutton(f, text="Also right after Close day", variable=after).grid(row=r, column=1, sticky="w", padx=8)
+        r += 1
+        keep = tk.StringVar(value=str(c["keep"]))
+        kf = ttk.Frame(f)
+        kf.grid(row=r, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Label(kf, text="Keep the newest").pack(side="left")
+        ttk.Spinbox(kf, from_=3, to=365, textvariable=keep, width=5).pack(side="left", padx=4)
+        ttk.Label(kf, text="backups of each kind in the 'CafePOS Backups' folder (older ones are deleted)").pack(side="left")
+        r += 1
+
+        def do_save(then_backup=False):
+            keep_fields()
+            c["files"] = {k: v.get() for k, v in picks.items()}
+            c["every_hours"], c["after_close"] = every[when.get()], after.get()
+            try:
+                c["keep"] = max(3, min(365, int(keep.get())))
+            except ValueError:
+                c["keep"] = 30
+            fresh = gdrive.load()  # don't overwrite a sign-in that finished meanwhile
+            c.update(refresh_token=fresh["refresh_token"], email=fresh["email"], folder_id=fresh["folder_id"])
+            gdrive.save(c)
+            log.info("Google Drive backup settings saved")
+            self.gdrive_status()
+            w.destroy()
+            if then_backup:
+                self.gdrive_now()
+        bar = ttk.Frame(f)
+        bar.grid(row=r, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        ttk.Button(bar, text="Save & back up now", command=lambda: do_save(True)).pack(side="right", padx=2)
+        ttk.Button(bar, text="Save", command=do_save).pack(side="right", padx=2)
 
     def toggle_autostart(self):
         try:
@@ -441,6 +598,9 @@ def main():
     if started:
         threading.Thread(target=win.watchdog, daemon=True).start()
         threading.Thread(target=win.update_loop, daemon=True).start()
+        threading.Thread(target=win.gdrive_loop, daemon=True).start()
+        app.AFTER_CLOSE_DAY = win.after_close_day
+    win.gdrive_status()
     root.mainloop()
 
 

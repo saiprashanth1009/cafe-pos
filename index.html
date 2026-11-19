@@ -67,6 +67,7 @@ main>section{padding:12px 16px}
 .kot li{padding:4px 0;border-bottom:1px dashed var(--line)}
 .kot .note{background:var(--busy);padding:6px 8px;border-radius:8px;margin-bottom:10px}
 .kot button{width:100%}
+.kot.done{border-top-color:var(--ok);opacity:.85}
 
 .stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-bottom:12px}
 .stats .card{margin:0}.stats b{display:block;font-size:22px}
@@ -122,12 +123,13 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
 <body>
 <nav>
   <b id="rname">POS</b>
-  <button data-view="floor">Tables</button>
-  <button data-view="kitchen">Kitchen</button>
-  <button data-view="dash" class="own">Dashboard</button>
-  <button data-view="reports" class="own">Reports</button>
-  <button data-view="menu" class="own">Menu</button>
-  <button data-view="settings" class="own">Settings</button>
+  <button data-view="floor" data-perm="orders">Tables</button>
+  <button data-view="kitchen" data-perm="kitchen">Kitchen</button>
+  <button data-view="dash" data-perm="dashboard">Dashboard</button>
+  <button data-view="reports" data-perm="reports">Reports</button>
+  <button data-view="menu" data-perm="menu">Menu</button>
+  <button data-view="settings" data-perm="settings">Settings</button>
+  <button data-view="profiles" data-perm="profiles">Profiles</button>
   <button id="whoBtn" class="who" type="button"></button>
 </nav>
 <div id="netBanner" class="card net" style="margin:8px 16px 0" hidden></div>
@@ -161,7 +163,7 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
   </aside>
 </section>
 
-<section id="kitchen" hidden><div id="kots" class="kots"></div></section>
+<section id="kitchen" hidden><div id="kots" class="kots"></div><div id="recent"></div></section>
 
 <section id="dash" hidden>
   <div class="bar wrap"><div id="dPeriod" class="seg" style="grid-template-columns:repeat(3,auto)">
@@ -189,6 +191,23 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
 </section>
 
 <section id="settings" hidden><form id="setForm" class="card form"></form></section>
+
+<section id="profiles" hidden>
+  <div class="card"><h2 style="margin-bottom:4px">Profiles</h2>
+    <p class="mute" style="margin:0">Up to 3 owners and 5 staff. Each person gets their own PIN and their own link to save
+      on their phone or tablet, and you tick what they can do. Every cancel, removed item, discount, void and refund is logged under their name.</p></div>
+  <div id="profList"></div>
+  <form id="profForm" class="card form" autocomplete="off">
+    <h3 id="profTitle" style="margin-top:0">New profile</h3>
+    <input type="hidden" name="pid">
+    <label>Name<input name="pname" maxlength="30" required placeholder="e.g. Sai"></label>
+    <label>Type<select name="prole"><option value="staff">Staff</option><option value="owner">Owner</option></select></label>
+    <label><span id="profPinLabel">PIN (6-12 digits, different for every person)</span>
+      <input name="ppin" type="password" inputmode="numeric" autocomplete="new-password" pattern="[0-9]{6,12}"></label>
+    <div><label>What this profile can do</label><div id="profPerms" class="picks"></div></div>
+    <div class="row"><button type="button" id="profClear">Clear</button><button class="pri">Save profile</button></div>
+  </form>
+</section>
 </main>
 
 <dialog id="custDlg"><form id="custForm">
@@ -219,9 +238,11 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
 </form></dialog>
 
 <dialog id="pinDlg"><form id="pinForm">
-  <h2>Staff PIN</h2>
+  <h2 id="pinTitle">Enter your PIN</h2>
+  <p id="pinNote" class="mute" style="margin:0"></p>
   <input name="pin" type="password" inputmode="numeric" autocomplete="off" required>
-  <button class="pri">Unlock</button>
+  <button class="pri">Sign in</button>
+  <a id="pinHome" href="/" class="mute" style="text-align:center" hidden>Not you? Open the main page</a>
 </form></dialog>
 
 <dialog id="customDlg"><form id="customForm">
@@ -243,7 +264,7 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
 <dialog id="tabletDlg"><form id="tabletForm" method="dialog">
   <h2>This tablet</h2>
   <p id="tabletWho" style="margin:0"></p>
-  <button type="button" id="roleSwitch" class="pri"></button>
+  <button type="button" id="logoutBtn" class="pri">Sign out</button>
   <label>Tablet name (shows in the audit log, e.g. Counter, Waiter 1)<input name="device" maxlength="40" autocomplete="off"></label>
   <label><input type="checkbox" name="phonePrint" style="width:auto"> Print from <b>this phone</b> on its Bluetooth printer
     (Android: install the free RawBT app and pair the printer in RawBT). Only this phone changes.</label>
@@ -264,19 +285,28 @@ const today = () => new Date().toLocaleDateString('en-CA');  // YYYY-MM-DD, loca
 const mins = t => Math.max(0, Math.round((Date.now() - new Date(t)) / 60000));
 
 let S = {}, items = [], orders = [], cur = null, cart = new Map(), cat = '', view = 'floor', lastBills = [];
-let ROLE = 'owner', OWNER_SET = false;  // from the server: which PIN this tablet uses
+let ROLE = 'owner', OWNER_SET = false, PROFILES_ON = false, ME = {name: '', perms: []};  // from the server
 const store = (k, v) => { try { if (v === undefined) return localStorage.getItem(k) || ''; localStorage.setItem(k, v) } catch { return '' } };
-let pin = store('pin');
+// Each profile has its own link (/profile=sai_owner). Its PIN and offline queue are kept under that link only,
+// so two people on one device (or two tabs) never overlap.
+const PROFILE = decodeURIComponent((location.pathname.match(/^\/profile=([^/?#]+)/) || [])[1] || '');
+const PKEY = PROFILE ? 'pin:' + PROFILE : 'pin', QKEY = PROFILE ? 'queue:' + PROFILE : 'queue';
+let pin = store(PKEY);
+const can = perm => (ME.perms || []).includes(perm);
+const profLink = slug => location.origin + '/profile=' + slug;
 
 // ---------- server ----------
 let pinWait = null;
 function askPin() {
   return pinWait ||= new Promise(res => {
     const d = $('#pinDlg'), f = $('#pinForm');
+    $('#pinTitle').textContent = PROFILE ? `PIN for ${PROFILE.replace(/_(owner|staff)$/, ' ($1)')}` : 'Enter your PIN';
+    $('#pinNote').textContent = PROFILE ? 'This link is only for this person. Save it on your phone or tablet.' : '';
+    $('#pinHome').hidden = !PROFILE;
     d.oncancel = e => e.preventDefault();
     f.onsubmit = e => {
       e.preventDefault(); pin = f.pin.value; f.reset();
-      try { localStorage.setItem('pin', pin) } catch {}
+      store(PKEY, pin);
       d.close(); pinWait = null; res();
     };
     d.showModal(); f.pin.focus();
@@ -288,7 +318,9 @@ async function api(path, body, typedPin) {
   const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 10000);
   try {
     r = await fetch(path, {method: body ? 'POST' : 'GET', signal: ctl.signal, body: body && JSON.stringify(body),
-                           headers: {'Content-Type': 'application/json', 'X-Pin': typedPin ?? pin, 'X-Device': store('device')}});
+                           headers: {'Content-Type': 'application/json', 'X-Pin': typedPin ?? pin, 'X-Device': store('device'),
+                                     // typed PIN = someone approving on this tablet: not this link's profile
+                                     ...(typedPin === undefined ? (PROFILE ? {'X-Profile': PROFILE} : {}) : {'X-For': ME.slug || ME.name || ''})}});
   } catch (e) {
     setOnline(false); throw Object.assign(new Error('offline'), {offline: true});
   } finally { clearTimeout(timer) }
@@ -299,14 +331,16 @@ async function api(path, body, typedPin) {
   if (!r.ok) { alert(j.error); throw Object.assign(new Error(j.error), {status: r.status}); }
   return j;
 }
-// Owner actions re-ask for the PIN (the server checks it), so a stray tap can't change things and a staff
-// tablet can get the owner's approval on the spot. opts adds fields: reason, check (label), amount, method.
+// Sensitive actions re-ask for a PIN (the server checks it), so a stray tap can't change things, and someone
+// allowed (e.g. an owner) can approve on another person's tablet. opts adds fields: reason, check (label),
+// amount, method; noPin = just confirm (and give a reason) when this profile may do it itself.
 function askConfirmPin(msg, opts = {}) {
   return new Promise(res => {
     const d = $('#confirmDlg'), f = $('#confirmForm');
     $('#confirmMsg').textContent = msg;
-    $('#confirmTitle').textContent = opts.title || (OWNER_SET ? 'Owner PIN' : 'Enter PIN');
+    $('#confirmTitle').textContent = opts.title || 'Confirm with your PIN';
     f.reset();
+    f.pin.hidden = !!opts.noPin; f.pin.required = !opts.noPin;
     $('#confirmExtra').innerHTML = (opts.amount !== undefined ? `<label>Amount ₹<input name="amount" type="number" min="0" step="0.01" inputmode="decimal" required value="${opts.amount}"></label>` : '')
       + (opts.method ? `<label>Given back by<select name="method">${PAYMENTS.map(p => `<option>${p}</option>`).join('')}</select></label>` : '')
       + (opts.reason ? '<label>Reason (saved in the audit log)<input name="reason" minlength="3" maxlength="200" required autocomplete="off"></label>' : '')
@@ -317,8 +351,18 @@ function askConfirmPin(msg, opts = {}) {
       d.close(); res(out);
     };
     d.onclose = () => res(null);  // Cancel / Esc; ignored if onsubmit already resolved
-    d.showModal(); (f.elements.amount || f.elements.reason || f.pin).focus();
+    d.showModal(); (f.elements.amount || f.elements.reason || (opts.noPin ? f.querySelector('button.pri') : f.pin)).focus();
   });
+}
+// Your profile may do it: confirm (+ reason). It may not: someone allowed types their PIN here to approve it,
+// and the audit log names them (and this tablet's profile). body may be a function of the dialog's answers.
+async function approve(msg, path, body, perm, opts = {}) {
+  const self = can(perm);
+  const a = await askConfirmPin(self ? msg : msg + '\n\nYour profile may not do this - someone allowed (e.g. an owner) types their PIN to approve.',
+                                {...opts, noPin: self, title: self ? 'Confirm' : 'Approval needed'});
+  if (!a) return null;
+  const b = typeof body === 'function' ? body(a) : {...body, ...(opts.reason ? {reason: a.reason} : {})};
+  return self ? api(path, b) : api(path, b, a.pin);
 }
 async function guarded(msg, path, body, opts = {}) {
   const a = await askConfirmPin(msg, opts);
@@ -329,9 +373,9 @@ async function guarded(msg, path, body, opts = {}) {
 
 // ---------- offline: KOTs wait on this tablet and send by themselves when the connection is back ----------
 let online = true, queue = [];
-try { queue = JSON.parse(store('queue') || '[]') } catch {}
+try { queue = JSON.parse(store(QKEY) || '[]') } catch {}
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-function saveQueue() { store('queue', JSON.stringify(queue)); renderNet() }
+function saveQueue() { store(QKEY, JSON.stringify(queue)); renderNet() }
 function setOnline(v) { if (online !== v) { online = v; renderNet() } }
 function renderNet() {
   const b = $('#netBanner');
@@ -353,32 +397,26 @@ async function flushQueue() {
   } finally { flushing = false }
 }
 
-// ---------- owner / staff ----------
+// ---------- who is signed in ----------
 function renderWho() {
-  document.querySelectorAll('nav .own').forEach(b => b.hidden = ROLE !== 'owner');
-  $('#whoBtn').textContent = (OWNER_SET ? (ROLE === 'owner' ? 'Owner' : 'Staff') : '') + ' ⚙';
+  document.querySelectorAll('nav [data-perm]').forEach(b => b.hidden = !can(b.dataset.perm));
+  $('#whoBtn').textContent = (ME.name || '') + ' ⚙';
 }
+const firstView = () => $('nav [data-perm]:not([hidden])')?.dataset.view || 'floor';
 $('#whoBtn').onclick = () => {
   const f = $('#tabletForm');
   f.device.value = store('device'); f.phonePrint.checked = phonePrint();
-  $('#tabletWho').innerHTML = !OWNER_SET ? 'One PIN for everyone. Set an <b>owner PIN</b> in Settings to give staff a limited PIN.'
-    : ROLE === 'owner' ? 'This tablet is unlocked for the <b>owner</b>.' : 'This tablet is in <b>staff</b> mode: orders, bills and kitchen.';
-  $('#roleSwitch').hidden = !OWNER_SET;
-  $('#roleSwitch').textContent = ROLE === 'owner' ? 'Lock to staff mode' : 'Owner: unlock this tablet';
+  $('#tabletWho').innerHTML = `Signed in as <b>${esc(ME.name)}</b> (${esc(ME.role)}).`
+    + (ME.slug ? `<br><small class="mute">Your link: ${esc(profLink(ME.slug))}</small>` : '')
+    + (!PROFILES_ON && can('profiles') ? '<br><small class="mute">Tip: create a profile for each person in <b>Profiles</b>.</small>' : '');
   $('#tabletDlg').showModal();
 };
 $('#tabletForm').device.onchange = e => store('device', e.target.value.trim());
 $('#tabletForm').phonePrint.onchange = e => store('phonePrint', e.target.checked ? '1' : '');
 $('#tabletTest').onclick = () => $('#testPrint').click();
-$('#roleSwitch').onclick = async () => {
-  const toOwner = ROLE !== 'owner';
-  const a = await askConfirmPin(toOwner ? 'Unlock owner screens (dashboard, reports, menu, settings) on this tablet.'
-                                        : 'Type the STAFF PIN to switch this tablet back to staff mode.', {title: toOwner ? 'Owner PIN' : 'Staff PIN'});
-  if (!a) return;
-  const st = await api('/api/state', null, a.pin);
-  if (toOwner !== (st.role === 'owner')) return alert(toOwner ? 'That is not the owner PIN.' : 'That is not the staff PIN.');
-  pin = a.pin; store('pin', pin); $('#tabletDlg').close();
-  await load(); if (ROLE !== 'owner' && $('nav .own.on')) show('floor');
+$('#logoutBtn').onclick = () => {  // forget this link's PIN; the next person signs in on the main page
+  if (queue.length && !confirm('KOTs are still waiting to be sent from this tablet. Sign out anyway?')) return;
+  store(PKEY, ''); location.href = '/';
 };
 let working = false;  // one action at a time: stops double-taps creating two KOTs/bills
 async function once(fn) { if (working) return; working = true; try { await fn() } finally { working = false } }
@@ -386,6 +424,12 @@ async function once(fn) { if (working) return; working = true; try { await fn() 
 async function load() {
   const st = await api('/api/state');
   S = st.settings; items = st.items; orders = st.orders; ROLE = st.role; OWNER_SET = st.owner_pin_set;
+  PROFILES_ON = st.profiles_on; ME = st.me;
+  if (!PROFILE && ME.slug) {  // signed in on the main page with a profile PIN: open that person's own link
+    store('pin:' + ME.slug, pin); store('pin', '');
+    location.replace('/profile=' + ME.slug);
+    return new Promise(() => {});
+  }
   $('#rname').textContent = S.name;
   renderWho();
   if (cur?.id) cur = orders.find(o => o.id === cur.id) || null;
@@ -400,6 +444,7 @@ function show(v) {
   if (v === 'kitchen') loadKitchen();
   if (v === 'reports') { $('#rday').value = S.business_day; loadReport() }
   if (v === 'dash') loadDash();
+  if (v === 'profiles') loadProfiles();
   render();
   scrollTo(0, 0);
 }
@@ -424,10 +469,10 @@ function renderFloor() {
   }
   $('#tables').innerHTML = h;
   // business day only moves on "Close day", so remind staff if yesterday was never closed
-  const late = S.business_day < today(), noOwner = ROLE === 'owner' && !OWNER_SET;
+  const late = S.business_day < today(), noOwner = can('profiles') && !PROFILES_ON;
   $('#dayBanner').hidden = !(late || noOwner);
   $('#dayBanner').innerHTML = (late ? `Bills are still going to <b>${fmtDay(S.business_day)}</b>. When you finish for that day, the owner closes it in <b>Reports → Close day</b>. ` : '')
-    + (noOwner ? 'Tip: set an <b>owner PIN</b> in Settings. The current PIN then becomes the staff PIN - staff can take orders and bill, but not change the menu, give discounts, cancel orders or see reports.' : '');
+    + (noOwner ? 'Tip: open <b>Profiles</b> and create one for each person (up to 3 owners and 5 staff), with their own PIN, link and what they may do. Once the first owner profile exists, the old shared PINs stop working.' : '');
   $('#others').innerHTML = `<button class="tile add" data-new="takeaway">+ Takeaway</button><button class="tile add" data-new="delivery">+ Delivery</button>`
     + orders.filter(o => o.type !== 'dine_in').map(o =>
       `<button class="tile busy" data-order="${o.id}">${TYPE[o.type]} #${o.id}<small>${esc(o.customer)}</small><small>${tileInfo(o)}</small></button>`).join('');
@@ -512,8 +557,8 @@ $('#ticket').onclick = e => {
   if (b.dataset.del) {
     const l = cur.lines.find(x => x.id === +b.dataset.del);
     once(async () => {
-      if (await guarded(`Remove ${l.qty} × ${l.name} (${money(l.qty * l.price)}) - already sent to the kitchen?`,
-                        '/api/orders/remove_line', {line_id: l.id}, {reason: true})) await load();
+      if (await approve(`Remove ${l.qty} × ${l.name} (${money(l.qty * l.price)}) - already sent to the kitchen?\nIt is saved in the audit log with your name.`,
+                        '/api/orders/remove_line', {line_id: l.id}, 'remove_item', {reason: true})) await load();
     });
   }
 };
@@ -537,8 +582,8 @@ async function sendKot() {
 }
 $('#sendKot').onclick = () => once(async () => { await sendKot(); cur = null; show('floor') });
 $('#cancelOrder').onclick = () => once(async () => {
-  if (!await guarded(`Cancel the whole order for ${orderTitle(cur)} (${money(cur.amount)})?\nIt shows in reports and the audit log as cancelled.`,
-                     '/api/orders/cancel', {order_id: cur.id}, {reason: true})) return;
+  if (!await approve(`Cancel the whole order for ${orderTitle(cur)} (${money(cur.amount)})?\nIt shows in reports and the audit log as cancelled.`,
+                     '/api/orders/cancel', {order_id: cur.id}, 'cancel', {reason: true})) return;
   cur = null; cart.clear(); await load(); show('floor');
 });
 
@@ -547,8 +592,8 @@ let discMode = '%';
 function calc(lines, disc) {  // preview only - mirrors totals() in app.py, which is what actually gets billed
   const sub = lines.reduce((a, l) => a + l.price * l.qty, 0);
   const dis = discMode === '₹' ? Math.min(Math.round(disc * 100), sub) : Math.round(sub * disc / 100);
-  const g = Math.round((sub - dis) * (+S.tax_pct / 2) / 100), raw = sub - dis + 2 * g, total = Math.floor((raw + 50) / 100) * 100;
-  return {sub, dis, cgst: g, sgst: g, ro: total - raw, total};
+  const g = Math.round((sub - dis) * (+S.tax_pct / 2) / 100);
+  return {sub, dis, cgst: g, sgst: g, ro: 0, total: sub - dis + 2 * g};  // no round-off: charged to the paisa
 }
 // pays: [{method, amount}] in paise. One row = the whole bill; more rows = split payment / split between people.
 let pays = [], picked = new Set(), billTotal = 0;
@@ -561,7 +606,7 @@ $('#billBtn').onclick = () => once(async () => {
   $('#splitBox').open = false;
   $('#billLines').innerHTML = cur.lines.map(l => `<label><input type="checkbox" data-line="${l.id}" checked> ${l.qty} × ${esc(l.name)}
       <span style="margin-left:auto">${money(l.qty * l.price)}</span></label>`).join('');
-  $('#discWho').textContent = ROLE === 'owner' ? '' : '(needs the owner PIN)';
+  $('#discWho').textContent = can('discount') ? '' : '(needs approval)';
   renderBill(); renderPays(); $('#billDlg').showModal();
 });
 function renderBill() {
@@ -579,7 +624,7 @@ function renderPays() {  // rebuilds the rows - only on add/remove/split, so typ
   const one = pays.length === 1;
   $('#payRows').innerHTML = pays.map((p, i) => `<div class="payrow">
       <select data-m="${i}">${PAYMENTS.map(m => `<option ${m === p.method ? 'selected' : ''}>${m}</option>`).join('')}</select>
-      <input data-a="${i}" type="number" min="0" step="1" inputmode="decimal" value="${p.amount / 100}" ${one ? 'disabled' : ''} aria-label="Amount ₹">
+      <input data-a="${i}" type="number" min="0" step="0.01" inputmode="decimal" value="${p.amount / 100}" ${one ? 'disabled' : ''} aria-label="Amount ₹">
       ${one ? '<span></span>' : `<button type="button" class="x" data-rm="${i}" aria-label="Remove payment">✕</button>`}</div>`).join('');
   payLeft();
 }
@@ -613,7 +658,7 @@ $('#addPay').onclick = () => {
   renderPays(); $('#payRows input')?.focus();
 };
 document.querySelectorAll('[data-eq]').forEach(b => b.onclick = () => {  // one bill, each person pays an equal share
-  const n = +b.dataset.eq, share = Math.floor(billTotal / n / 100) * 100;
+  const n = +b.dataset.eq, share = Math.floor(billTotal / n);  // the last person pays the odd paise
   pays = Array.from({length: n}, (_, i) => ({method: pays[i]?.method || 'Cash', amount: i < n - 1 ? share : billTotal - share * (n - 1)}));
   renderPays();
 });
@@ -632,8 +677,9 @@ $('#billForm').onsubmit = e => {
       ...(picked.size < cur.lines.length ? {line_ids: [...picked]} : {}),
       ...(pays.length > 1 ? {payments: pays.map(p => ({method: p.method, amount: (p.amount / 100).toFixed(2)}))} : {payment: pays[0].method})};
     let typed;
-    if (v && ROLE !== 'owner') {  // discount from a staff tablet: the owner approves it here
-      const a = await askConfirmPin(`Give a discount of ${discMode === '%' ? v + '%' : '₹' + v} on ${orderTitle(cur)}?`, {reason: true});
+    if (v && !can('discount')) {  // someone allowed to give discounts approves it here
+      const a = await askConfirmPin(`Give a discount of ${discMode === '%' ? v + '%' : '₹' + v} on ${orderTitle(cur)}?`,
+                                    {reason: true, title: 'Approval needed'});
       if (!a) return;
       typed = a.pin; body.reason = a.reason;
     }
@@ -675,8 +721,14 @@ function printReceipt(b) {
 
 // ---------- kitchen ----------
 async function loadKitchen() {
-  const kots = await api('/api/kitchen');
+  const {kots, recent} = await api('/api/kitchen');
   if (view !== 'kitchen') return;
+  const title = k => k.type === 'dine_in' ? 'Table ' + k.table_no : TYPE[k.type] + ' #' + k.order_id;
+  $('#recent').innerHTML = recent.length ? '<h3>Recently marked ready - last 10 (tap "Back to cooking" if it was a mis-tap)</h3><div class="kots">'
+    + recent.map(k => `<div class="card kot done"><div class="row"><b style="font-size:18px">${esc(title(k))}</b>
+      <span class="mute">KOT ${k.id}${k.ready_at ? ' · ready ' + k.ready_at.slice(11, 16) : ''}</span></div>
+      <ul>${k.lines.map(l => `<li><b>${l.qty}</b> × ${esc(l.name)}</li>`).join('')}</ul>
+      ${k.note ? `<div class="note">📝 ${esc(k.note)}</div>` : ''}<button data-undo="${k.id}">↩ Back to cooking</button></div>`).join('') + '</div>' : '';
   $('#kots').innerHTML = kots.map(k => `<div class="card kot ${mins(k.created) >= 15 ? 'late' : ''}">
       <div class="row"><b style="font-size:20px">${k.type === 'dine_in' ? 'Table ' + k.table_no : TYPE[k.type] + ' #' + k.order_id}</b>
       <span class="mute">KOT ${k.id} · ${mins(k.created)} min</span></div>
@@ -685,9 +737,10 @@ async function loadKitchen() {
       <button class="ok" data-ready="${k.id}">Mark ready</button></div>`).join('')
     || '<p class="mute">No pending orders.</p>';
 }
-$('#kots').onclick = e => {
-  const id = e.target.closest('button')?.dataset.ready;
-  if (id) once(async () => { await api('/api/kots/ready', {id: +id}); await loadKitchen() });
+$('#kitchen').onclick = e => {
+  const t = e.target.closest('button')?.dataset; if (!t) return;
+  if (t.ready) once(async () => { await api('/api/kots/ready', {id: +t.ready}); await loadKitchen() });
+  if (t.undo) once(async () => { await api('/api/kots/undo', {id: +t.undo}); await loadKitchen() });
 };
 
 // ---------- reports ----------
@@ -706,7 +759,8 @@ async function loadReport() {
   lastBills = r.bills;
   const aud = await api('/api/audit?day=' + r.day);
   const ACT = {cancel_order: 'Cancelled order', remove_item: 'Removed item', void_bill: 'Voided bill', refund: 'Refund',
-               discount: 'Discount', menu_save: 'Menu change', menu_delete: 'Menu delete', settings: 'Settings', close_day: 'Closed day'};
+               discount: 'Discount', menu_save: 'Menu change', menu_delete: 'Menu delete', settings: 'Settings', close_day: 'Closed day',
+               profile_save: 'Profile saved', profile_delete: 'Profile deleted'};
   $('#rep').innerHTML = `<div class="stats">${tile('Net sales', money(r.net))}${tile('Bills', r.count)}
       ${tile('GST collected', money(s.cgst + s.sgst))}${tile('Discounts given', money(s.discount))}${tile('Cancelled orders', r.cancelled)}
       ${tile('Voided bills', r.voided.count + (r.voided.count ? ' · ' + money(r.voided.total) : ''))}${tile('Refunds', money(r.refunds))}</div>
@@ -720,7 +774,7 @@ async function loadReport() {
         <td class="r" style="white-space:nowrap">${b.voided ? `<span class="tag" title="${esc(b.void_reason)}">VOID</span> ` : ''}<button data-reprint="${b.id}">Reprint</button>
           ${b.voided ? '' : `<button data-refund="${b.id}">Refund</button> <button class="warn" data-void="${b.id}">Void</button>`}</td></tr>`).join('')}</table></div>
     <div class="card"><h3 style="margin-top:0">Audit log - who did what</h3>${aud.length ? `<table><tr><th>Time</th><th>Who</th><th>What</th><th class="r">Amount</th><th>Reason / details</th></tr>
-      ${aud.map(a => `<tr><td>${a.at.slice(11, 16)}</td><td>${esc(a.role)}${a.device ? '<br><small class="mute">' + esc(a.device) + '</small>' : ''}</td>
+      ${aud.map(a => `<tr><td>${a.at.slice(11, 16)}</td><td><b>${esc(a.who || a.role)}</b><br><small class="mute">${esc(a.role)}${a.device ? ' · ' + esc(a.device) : ''}</small></td>
         <td>${esc(ACT[a.action] || a.action)}${a.order_id ? ` <small class="mute">#${a.order_id}</small>` : ''}</td><td class="r">${a.amount ? money(a.amount) : ''}</td>
         <td>${a.reason ? '<b>' + esc(a.reason) + '</b><br>' : ''}<small class="mute">${esc(a.detail)}</small></td></tr>`).join('')}</table>`
       : '<p class="mute">Nothing cancelled, voided, refunded or changed this day.</p>'}</div>`;
@@ -731,18 +785,17 @@ $('#rep').onclick = e => {
   if (t.reprint) return printReceipt(b);
   const label = `bill ${b.bill_label} (${money(b.total)})`;
   if (t.void) once(async () => {
-    const a = await askConfirmPin(`Void ${label}? It keeps its number but leaves the totals, and shows as VOID.`,
-                                  {reason: true, check: 'Reopen the items as an open order to correct and bill again'});
-    if (!a) return;
-    const res = await api('/api/bills/void', {order_id: b.id, reason: a.reason, reopen: a.check}, a.pin);
+    const res = await approve(`Void ${label}? It keeps its number but leaves the totals, and shows as VOID.`, '/api/bills/void',
+                              a => ({order_id: b.id, reason: a.reason, reopen: a.check}), 'void_refund',
+                              {reason: true, check: 'Reopen the items as an open order to correct and bill again'});
+    if (!res) return;
     if (res.reopened) alert('Voided. The items are back as an open order on the Tables screen - correct them and bill again.');
     await load(); await loadReport();
   });
   if (t.refund) once(async () => {
-    const a = await askConfirmPin(`Refund on ${label}${b.refunded ? `, already refunded ${money(b.refunded)}` : ''}.`,
-                                  {reason: true, amount: (b.total - b.refunded) / 100, method: true});
-    if (!a) return;
-    await api('/api/bills/refund', {order_id: b.id, amount: a.amount, method: a.method, reason: a.reason}, a.pin);
+    if (!await approve(`Refund on ${label}${b.refunded ? `, already refunded ${money(b.refunded)}` : ''}.`, '/api/bills/refund',
+                       a => ({order_id: b.id, amount: a.amount, method: a.method, reason: a.reason}), 'void_refund',
+                       {reason: true, amount: (b.total - b.refunded) / 100, method: true})) return;
     await loadReport();
   });
 };
@@ -766,7 +819,7 @@ function printDayReport(r) {  // end-of-day report (Z report)
     + `<br>${r.open ? 'Day still open' : 'Day closed'} · printed ${new Date().toLocaleString('en-IN', {dateStyle: 'short', timeStyle: 'short'})}</div><hr>`
     + row('Bills', r.count) + row('Cancelled orders', r.cancelled) + '<hr>'
     + row('Gross (before discount)', money(s.subtotal)) + row('Discounts', '−' + money(s.discount))
-    + row(`CGST @ ${h}%`, money(s.cgst)) + row(`SGST @ ${h}%`, money(s.sgst)) + row('Round off', money(s.round_off))
+    + row(`CGST @ ${h}%`, money(s.cgst)) + row(`SGST @ ${h}%`, money(s.sgst)) + (s.round_off ? row('Round off', money(s.round_off)) : '')
     + (r.voided?.count ? row(`Voided bills (${r.voided.count})`, money(r.voided.total)) : '')
     + (r.refunds ? row('Bills total', money(s.total)) + row('Refunds', '−' + money(r.refunds)) : '')
     + '<hr>' + row('NET SALES', money(r.net ?? s.total), 'big') + '<hr><b>By payment</b>'
@@ -823,7 +876,7 @@ $('#testPrint').onclick = () => {
   once(async () => { await api('/api/print', {test: true}); alert(`Test page sent to ${S.printer}.`) });
 };
 $('#backupBtn').onclick = () => once(async () => {
-  const r = await fetch('/api/backup', {headers: {'X-Pin': pin}});
+  const r = await fetch('/api/backup', {headers: {'X-Pin': pin, ...(PROFILE ? {'X-Profile': PROFILE} : {})}});
   if (!r.ok) return alert('Backup failed - check the PIN and try again.');
   const a = document.createElement('a');
   a.href = URL.createObjectURL(await r.blob()); a.download = `pos-backup-${today()}.db`; a.click();
@@ -831,6 +884,7 @@ $('#backupBtn').onclick = () => once(async () => {
 function renderSettings() {
   const f = $('#setForm');
   for (const [k] of FIELDS) if (k !== 'printer') f.elements[k].value = PINS.includes(k) ? '' : S[k] ?? '';
+  PINS.forEach(k => f.elements[k].closest('label').hidden = PROFILES_ON);  // with profiles, PINs live in Profiles
   api('/api/printers').then(r => {  // COM ports on the counter PC; Bluetooth printers get one when paired
     const ports = r.ports.map(p => p.port);
     if (S.printer && !ports.includes(S.printer)) ports.push(S.printer);  // saved one, even if unpaired right now
@@ -847,8 +901,73 @@ $('#setForm').onsubmit = e => {
     if (!await guarded('Save these settings?' + (d.owner_pin || d.pin ? '\nThis changes a PIN - type the current owner PIN to confirm.' : ''), '/api/settings', d)) return;
     // this tablet keeps owner rights: it follows the new owner PIN (or the only PIN while there is no owner PIN)
     if (d.owner_pin) pin = d.owner_pin; else if (d.pin && !OWNER_SET) pin = d.pin;
-    store('pin', pin);
+    store(PKEY, pin);
     await load(); alert('Settings saved' + (d.owner_pin ? '. Staff tablets keep using the staff PIN; this tablet now uses the owner PIN.' : ''));
+  });
+};
+
+// ---------- profiles (owners) ----------
+let PROF = null;
+async function loadProfiles() {
+  PROF = await api('/api/profiles');
+  if (view !== 'profiles') return;
+  const n = {owner: 0, staff: 0}; PROF.profiles.forEach(p => n[p.role]++);
+  const short = k => esc(PROF.perms[k].replace(/ \(.*\)$/, ''));
+  $('#profList').innerHTML = `<div class="card">${PROF.profiles.length ? `<table><tr><th>Name</th><th>Can do</th><th>Their link</th><th></th></tr>
+    ${PROF.profiles.map(p => `<tr><td><b>${esc(p.name)}</b><br><small class="mute">${p.role}</small></td>
+      <td><small>${p.perms.map(short).join(' · ')}</small></td>
+      <td><small>${esc(profLink(p.slug))}</small><br><button type="button" data-copy="${esc(p.slug)}">Copy link</button>
+        <button type="button" data-open="${esc(p.slug)}">Open</button></td>
+      <td class="r" style="white-space:nowrap"><button type="button" data-pedit="${p.id}">Edit</button>
+        <button type="button" class="warn" data-pdel="${p.id}">Delete</button></td></tr>`).join('')}</table>`
+    : '<p class="mute" style="margin:0">No profiles yet. Create the first <b>owner</b> profile for yourself below - after that, the old shared PINs stop working and everyone signs in with their own PIN.</p>'}
+    <p class="mute" style="margin:8px 0 0">${n.owner} of ${PROF.max.owner} owners · ${n.staff} of ${PROF.max.staff} staff</p></div>`;
+  if (!$('#profForm').elements.pid.value) fillProf();
+}
+function renderPerms(sel) {
+  const owner = $('#profForm').elements.prole.value === 'owner';
+  $('#profPerms').innerHTML = Object.entries(PROF.perms).filter(([k]) => k !== 'profiles' || owner).map(([k, l]) =>
+    `<label><input type="checkbox" value="${k}" ${sel.includes(k) || k === 'profiles' ? 'checked' : ''} ${k === 'profiles' ? 'disabled' : ''}> ${esc(l)}</label>`).join('');
+}
+function fillProf(p) {
+  const f = $('#profForm'), x = f.elements; f.reset();
+  x.pid.value = p?.id || ''; x.pname.value = p?.name || ''; x.prole.value = p?.role || 'staff';
+  x.ppin.required = !p;
+  $('#profTitle').textContent = p ? 'Edit ' + p.name : 'New profile';
+  $('#profPinLabel').textContent = p ? 'New PIN (blank = keep the current one)' : 'PIN (6-12 digits, different for every person)';
+  renderPerms(p ? p.perms : PROF.staff_default);
+}
+$('#profForm').elements.prole.onchange = e => renderPerms(e.target.value === 'owner' ? Object.keys(PROF.perms) : PROF.staff_default);
+$('#profClear').onclick = () => fillProf();
+$('#profList').onclick = e => {
+  const t = e.target.closest('button')?.dataset; if (!t) return;
+  if (t.copy) {
+    const link = profLink(t.copy);
+    (navigator.clipboard?.writeText(link) || Promise.reject()).then(() => alert('Link copied:\n' + link), () => prompt('Copy this link:', link));
+  }
+  if (t.open) window.open(profLink(t.open), '_blank');  // its own page: never mixes with this one
+  if (t.pedit) { fillProf(PROF.profiles.find(p => p.id === +t.pedit)); $('#profForm').scrollIntoView() }
+  if (t.pdel) {
+    const p = PROF.profiles.find(x => x.id === +t.pdel);
+    if (confirm(`Delete ${p.name} (${p.role})? Their PIN and link stop working. Their history stays in the audit log.`))
+      once(async () => { await api('/api/profiles/delete', {id: p.id}); fillProf(); await loadProfiles() });
+  }
+};
+$('#profForm').onsubmit = e => {
+  e.preventDefault();
+  const x = e.target.elements;
+  const body = {id: +x.pid.value || undefined, name: x.pname.value.trim(), role: x.prole.value, pin: x.ppin.value,
+                perms: [...document.querySelectorAll('#profPerms input:checked')].map(i => i.value)};
+  once(async () => {
+    const wasOn = PROFILES_ON;
+    const r = await api('/api/profiles/save', body);
+    if (!wasOn && body.role === 'owner') {  // first owner profile: the shared PINs stop, continue as this profile
+      store('pin:' + r.slug, body.pin); store(PKEY, '');
+      alert(`Profiles are on. The old shared PINs no longer work.\n\nThis tablet now opens ${body.name}'s own link:\n${profLink(r.slug)}\n\nSave it as a bookmark or home-screen icon.`);
+      location.href = '/profile=' + r.slug;
+      return;
+    }
+    fillProf(); await loadProfiles();
   });
 };
 
@@ -913,7 +1032,7 @@ setInterval(() => {
 }, 5000);
 
 renderNet();
-load().then(() => show('floor')).catch(() => {}).finally(() => flushQueue());  // offline at start: the 5 s refresh retries
+load().then(() => show(firstView())).catch(() => {}).finally(() => flushQueue());  // offline at start: the 5 s refresh retries
 </script>
 </body>
 </html>
