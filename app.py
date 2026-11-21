@@ -85,6 +85,10 @@ def init(con):
             con.execute("ALTER TABLE kots ADD COLUMN client_id TEXT")  # tablet's id for a KOT, so offline resends don't double up
         if "ready_at" not in kcols:
             con.execute("ALTER TABLE kots ADD COLUMN ready_at TEXT")  # kitchen's "recently ready" list (undo a mis-tap)
+        if "kind" not in kcols:  # 'kot' = to cook, 'note' = note only (sent later), 'served' = ready-to-serve items
+            con.execute("ALTER TABLE kots ADD COLUMN kind TEXT NOT NULL DEFAULT 'kot'")
+        if "direct" not in {r[1] for r in con.execute("PRAGMA table_info(items)")}:
+            con.execute("ALTER TABLE items ADD COLUMN direct INTEGER NOT NULL DEFAULT 0")  # ready to serve: skips the kitchen
         if "who" not in {r[1] for r in con.execute("PRAGMA table_info(audit)")}:
             con.execute("ALTER TABLE audit ADD COLUMN who TEXT")  # profile name
         # secret for PIN hashes, made once per database (profile PINs are never stored as typed)
@@ -159,10 +163,13 @@ def order_out(con, r):
     if o.get("bill_no"):
         o["bill_label"] = bill_label(o["day"], o["day_no"]) if o.get("day_no") else str(o["bill_no"])  # old bills
     o["lines"] = [dict(l) for l in con.execute(
-        "SELECT l.id, l.name, l.price, l.qty, l.kot_id, k.status AS kot_status FROM lines l "
+        "SELECT l.id, l.name, l.price, l.qty, l.kot_id, k.status AS kot_status, k.kind AS kot_kind FROM lines l "
         "JOIN kots k ON k.id = l.kot_id WHERE l.order_id = ? ORDER BY l.id", (r["id"],))]
     o["amount"] = sum(l["price"] * l["qty"] for l in o["lines"])
     o["pending"] = len({l["kot_id"] for l in o["lines"] if l["kot_status"] == "new"})
+    o["notes"] = [dict(k) for k in con.execute(  # kitchen notes already sent for this order
+        "SELECT id, created, note, status FROM kots WHERE order_id = ? AND kind != 'served' AND COALESCE(note, '') != '' "
+        "ORDER BY id", (r["id"],))]
     if o["status"] == "billed":
         o["payments"] = [dict(p) for p in con.execute("SELECT method, amount FROM payments WHERE order_id = ? ORDER BY id", (r["id"],))]
         o["refunded"] = con.execute("SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE order_id = ?", (r["id"],)).fetchone()[0]
@@ -271,7 +278,7 @@ def state(con, q):
             "role": w["role"], "owner_pin_set": bool(s.get("owner_pin")), "profiles_on": profiles_on(con),
             "me": {"name": w["name"], "role": w["role"], "slug": w["slug"], "perms": sorted(w["perms"])},
             "items": [dict(r) for r in con.execute(
-                "SELECT id, name, category, price FROM items WHERE active = 1 ORDER BY id")],  # menu.csv order
+                "SELECT id, name, category, price, direct FROM items WHERE active = 1 ORDER BY id")],  # menu.csv order
             "orders": [order_out(con, r) for r in con.execute("SELECT * FROM orders WHERE status = 'open' ORDER BY id")]}
 
 
@@ -279,10 +286,11 @@ def kitchen(con, q):
     def tickets(where, order, limit=""):
         out = []
         for k in con.execute(
-                "SELECT k.id, k.created, k.ready_at, k.note, k.order_id, o.type, o.table_no, o.customer FROM kots k "
-                f"JOIN orders o ON o.id = k.order_id WHERE {where} AND o.status != 'cancelled' ORDER BY {order} {limit}"):
+                "SELECT k.id, k.created, k.ready_at, k.note, k.kind, k.order_id, o.type, o.table_no, o.customer FROM kots k "
+                f"JOIN orders o ON o.id = k.order_id WHERE {where} AND k.kind != 'served' AND o.status != 'cancelled' "
+                f"ORDER BY {order} {limit}"):
             lines = [dict(l) for l in con.execute("SELECT name, qty FROM lines WHERE kot_id = ? ORDER BY id", (k["id"],))]
-            if lines:  # every line removed -> nothing left to cook
+            if lines or k["kind"] == "note":  # every line removed -> nothing left to cook
                 out.append({**dict(k), "lines": lines})
         return out
     return {"kots": tickets("k.status = 'new'", "k.id"),
@@ -369,13 +377,16 @@ def dashboard(con, q):
 # ---- POST routes (con, body) ----
 def save_item(con, d):
     name, cat, price = str(d["iname"]).strip(), str(d.get("icat") or "").strip() or "Other", paise(d["iprice"])
+    direct = 1 if d.get("idirect") not in (None, "", False, 0, "0", "false") else 0  # ready to serve: skips the kitchen
     if not name or price < 0:
         raise ValueError("name required, price must be >= 0")
     if d.get("iid"):
-        con.execute("UPDATE items SET name = ?, category = ?, price = ? WHERE id = ?", (name, cat, price, int(d["iid"])))
+        con.execute("UPDATE items SET name = ?, category = ?, price = ?, direct = ? WHERE id = ?",
+                    (name, cat, price, direct, int(d["iid"])))
     else:
-        con.execute("INSERT INTO items(name, category, price) VALUES(?, ?, ?)", (name, cat, price))
-    audit(con, d, "menu_save", amount=price, detail=f"{name} ({cat})" + (" - changed" if d.get("iid") else " - added"))
+        con.execute("INSERT INTO items(name, category, price, direct) VALUES(?, ?, ?, ?)", (name, cat, price, direct))
+    audit(con, d, "menu_save", amount=price, detail=f"{name} ({cat})" + (", ready to serve" if direct else "")
+          + (" - changed" if d.get("iid") else " - added"))
     return {"ok": True}
 
 
@@ -459,20 +470,32 @@ def send_kot(con, d):
             name, price = str(l.get("name") or "").strip()[:60], paise(l["price"])
             if not name or price < 0:
                 raise ValueError("custom item needs a name and a price")
-            lines.append((None, name, price, qty))
+            lines.append((None, name, price, qty, bool(l.get("direct"))))
             continue
-        r = con.execute("SELECT id, name, price FROM items WHERE id = ? AND active = 1", (int(l["id"]),)).fetchone()
+        r = con.execute("SELECT id, name, price, direct FROM items WHERE id = ? AND active = 1", (int(l["id"]),)).fetchone()
         if not r:
             raise ValueError("invalid item")
-        lines.append((r["id"], r["name"], r["price"], qty))
-    if not lines:
+        lines.append((r["id"], r["name"], r["price"], qty, bool(r["direct"])))
+    note = str(d.get("note") or "").strip()[:200]
+    cook, served = [l[:4] for l in lines if not l[4]], [l[:4] for l in lines if l[4]]
+    if not lines and not note:
         raise ValueError("no items")
-    kid = con.execute("INSERT INTO kots(order_id, created, note, client_id) VALUES(?, ?, ?, ?)",
-                      (oid, now(), str(d.get("note") or "").strip()[:200], cid)).lastrowid
-    con.executemany("INSERT INTO lines(order_id, kot_id, item_id, name, price, qty) VALUES(?, ?, ?, ?, ?, ?)",
-                    [(oid, kid, *l) for l in lines])
-    log.info("KOT %s -> kitchen for order #%s: %s", kid, oid,
-             ", ".join(f"{q}x {n}" + ("" if i else f" (custom, {rs(p)})") for i, n, p, q in lines))
+    kid = None
+    if cook or note:  # to the kitchen: items to cook, or just a note for an order already sent
+        kid = con.execute("INSERT INTO kots(order_id, created, note, client_id, kind) VALUES(?, ?, ?, ?, ?)",
+                          (oid, now(), note, cid, "kot" if cook else "note")).lastrowid
+        con.executemany("INSERT INTO lines(order_id, kot_id, item_id, name, price, qty) VALUES(?, ?, ?, ?, ?, ?)",
+                        [(oid, kid, *l) for l in cook])
+        log.info("KOT %s -> kitchen for order #%s: %s", kid, oid,
+                 ", ".join(f"{q}x {n}" + ("" if i else f" (custom, {rs(p)})") for i, n, p, q in cook)
+                 + (f" | note: {note}" if note else ""))
+    if served:  # bottled water, soft drinks...: billed, never shown in the kitchen
+        sid = con.execute("INSERT INTO kots(order_id, created, ready_at, note, client_id, kind, status) "
+                          "VALUES(?, ?, ?, '', ?, 'served', 'ready')", (oid, now(), now(), None if kid else cid)).lastrowid
+        con.executemany("INSERT INTO lines(order_id, kot_id, item_id, name, price, qty) VALUES(?, ?, ?, ?, ?, ?)",
+                        [(oid, sid, *l) for l in served])
+        log.info("Order #%s: served without kitchen: %s", oid, ", ".join(f"{q}x {n}" for i, n, p, q in served))
+        kid = kid or sid
     return {"id": kid, "order_id": oid}
 
 
@@ -1279,6 +1302,31 @@ def selftest():
         assert all(x["id"] != k2["id"] for x in kd["kots"])
         kot_undo(con, {"id": k2["id"]})
         assert any(x["id"] == k2["id"] for x in kitchen(con, {})["kots"])
+        # ready-to-serve items (bottled water...) are billed but never reach the kitchen
+        save_item(con, {**me, "iname": "Water Bottle", "icat": "Drinks", "iprice": "20", "idirect": "on"})
+        wid = con.execute("SELECT id, direct FROM items WHERE name = 'Water Bottle'").fetchone()
+        assert wid["direct"] == 1
+        k3 = send_kot(con, {**w0, "client_id": "mix1", "order": {"type": "takeaway"},
+                            "lines": [{"id": pid, "qty": 1}, {"id": wid["id"], "qty": 2}]})
+        o3 = get_order(con, k3["order_id"])
+        assert o3["amount"] == 24950 + 4000 and {l["kot_kind"] for l in o3["lines"]} == {"kot", "served"}
+        kt = next(x for x in kitchen(con, {})["kots"] if x["order_id"] == o3["id"])
+        assert kt["lines"] == [{"name": "Paneer Tikka", "qty": 1}]  # water not on the kitchen ticket
+        assert send_kot(con, {**w0, "client_id": "mix1", "order": {"type": "takeaway"},
+                              "lines": [{"id": wid["id"], "qty": 2}]})["duplicate"]  # resend never doubles
+        k4 = send_kot(con, {**w0, "order": {"type": "takeaway"}, "lines": [{"id": wid["id"], "qty": 1}]})
+        kd = kitchen(con, {})
+        assert all(x["order_id"] != k4["order_id"] for x in kd["kots"] + kd["recent"])
+        # a note sent after the items already went to the kitchen
+        kn = send_kot(con, {**w0, "order_id": o3["id"], "note": "make it extra spicy", "lines": []})
+        nt = next(x for x in kitchen(con, {})["kots"] if x["id"] == kn["id"])
+        assert nt["kind"] == "note" and nt["lines"] == [] and nt["note"] == "make it extra spicy"
+        assert [n["note"] for n in get_order(con, o3["id"])["notes"]] == ["make it extra spicy"]
+        try:
+            send_kot(con, {**w0, "order_id": o3["id"], "note": "  ", "lines": []})
+            raise AssertionError("empty KOT")
+        except ValueError:
+            pass
         st = state(con, me)
         assert st["me"]["name"] == "Sai" and st["me"]["slug"] == "sai_owner" and st["profiles_on"]
         assert "pin_key" not in st["settings"]
