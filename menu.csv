@@ -1,13 +1,12 @@
 category,name,price
-Burgers,Classic Veg Burger,109
-Burgers,Classic Veg Burger (Dip),149
-Burgers,Paneer Burger,119
-Burgers,Paneer Burger (Dip),159
+Burgers,Classic Veg Burger,119
+Burgers,Classic Veg Burger (Cheese Bomb),159
+Burgers,Paneer Burger,139
+Burgers,Paneer Burger (Cheese Bomb),179
 Burgers,Classic Chicken Burger,129
-Burgers,Classic Chicken Burger (Dip),169
+Burgers,Classic Chicken Burger (Cheese Bomb),169
 Burgers,Crispy Chicken Burger,139
-Burgers,Crispy Chicken Burger (Dip),179
-Sandwiches,Bombay Velvet,89
+Burgers,Crispy Chicken Burger (Cheese Bomb),179
 Sandwiches,Classic Veg Grilled Sandwich,119
 Sandwiches,Cheese Corn Grilled Sandwich,119
 Sandwiches,Tandoori Paneer Grilled Sandwich,129
@@ -18,8 +17,10 @@ Maggi,Vegetable Maggi,89
 Maggi,Egg Maggi,99
 Maggi,Cheese Corn Maggi,99
 Maggi,Chicken Maggi,119
-Pasta,Red Sauce Pasta,129
-Pasta,White Sauce Pasta,179
+Pasta,Veg Arrabbiata Pasta,149
+Pasta,Veg Alfredo Pasta,179
+Pasta,Chicken Arrabbiata Pasta,189
+Pasta,Chicken Alfredo Pasta,219
 Momos,Veg Fried Momos,99
 Momos,Paneer Fried Momos,109
 Momos,Chicken Fried Momos,119
@@ -29,100 +30,96 @@ Momos,Chicken Pan Fried Momos,129
 Momos,Veg Kurkure Momos,119
 Momos,Paneer Kurkure Momos,129
 Momos,Chicken Kurkure Momos,139
-Quick Bites,Classic French Fries,99
+Quick Bites,Classic French Fries,109
 Quick Bites,Veg Nuggets,99
 Quick Bites,Cheese Balls,99
-Quick Bites,Chicken Nuggets,109
 Quick Bites,Peri Peri French Fries,119
 Quick Bites,Veg Spring Rolls,119
 Quick Bites,Butter Garlic French Fries,129
-Quick Bites,Veg Loaded French Fries,139
-Quick Bites,Chicken Loaded French Fries,149
-Quick Bites,Quick Bites Veg Platter,179
-Quick Bites,Quick Bites Non-Veg Platter,189
-Bakes,Maska Bun,89
-Bakes,Nutella Bun,89
-Bakes,Cheese Garlic Bread,119
+Quick Bites,Veg Loaded French Fries,149
+Quick Bites,Veg Quick Bites Platter,249
+Quick Bites,Chicken Nuggets,109
+Quick Bites,Chicken Strips,109
+Quick Bites,Chicken Popcorn,119
+Quick Bites,Chicken Fingers,119
+Quick Bites,Crispy Chicken Wings,129
+Quick Bites,Chicken Loaded French Fries,169
+Quick Bites,Non-Veg Quick Bites Platter,259
 Soups,Classic Veg Soup,79
 Soups,Veg Sweet Corn Soup,89
 Soups,Manchow Soup - Veg,99
 Soups,Manchow Soup - Chicken,109
 Soups,Hot & Sour Soup - Veg,109
 Soups,Hot & Sour Soup - Chicken,119
-Starters Veg,Crispy Corn,139
 Starters Veg,Veg Manchurian,149
-Starters Veg,Baby Corn Manchurian,169
-Starters Veg,Chilli Paneer,169
-Starters Veg,Paneer Bombastic,189
-Starters Non-Veg,Chicken Majestic,169
-Starters Non-Veg,Chicken 65,169
-Starters Non-Veg,Butter Garlic Chicken,189
-Starters Non-Veg,Chicken Manchurian,189
+Starters Veg,Crispy Corn,159
+Starters Veg,Chilli Paneer,179
+Starters Veg,Paneer 65,189
+Starters Veg,Paneer Bombastic,219
+Starters Non-Veg,Chicken Manchurian,179
+Starters Non-Veg,Chicken 65,189
 Starters Non-Veg,Chilli Chicken,189
-Starters Non-Veg,Chicken Lollipop,219
+Starters Non-Veg,Butter Garlic Chicken,209
+Starters Non-Veg,Chicken Majestic,219
+Starters Non-Veg,Chicken Lollipop,229
 Fried Rice,Veg Fried Rice,149
 Fried Rice,Egg Fried Rice,169
 Fried Rice,Paneer Fried Rice,179
 Fried Rice,Chicken Fried Rice,179
-Desserts,Pineapple Sandwich,149
-Desserts,Gulabi Velvet,149
-Desserts,Chocolate Ammunition,119
-Desserts,Brownie Bullets,119
-Desserts,Royal Apricot Bliss,149
-Desserts,Sizzler Brownie,169
-Tea,Classic Tea,35
-Tea,Elaichi Tea,40
-Tea,Ginger Tea,40
-Tea,Adrak Elaichi Bliss,45
+Desserts,Pineapple Sandwich,129
+Desserts,Brownie Bullets,139
+Desserts,Apricot Delight,149
+Desserts,Gulabi Velvet,159
+Desserts,Sizzler Brownie,179
+Tea,Classic Tea,40
+Tea,Elaichi Tea,45
+Tea,Ginger Tea,45
 Tea,Lemon Honey Tea,45
 Tea,Ginger Lemon Honey Tea,45
-Coffee,Black Coffee,30
-Coffee,Classic Coffee,35
+Tea,Adrak Elaichi Bliss,50
+Coffee,Black Coffee,35
+Coffee,Classic Coffee,40
 Coffee,Hazelnut Coffee,45
 Coffee,Vanilla Coffee,45
 Coffee,Butterscotch Coffee,45
 Coffee,Chocolate Coffee,45
-Coffee,Classic Cold Coffee,119
+Signature Sips,Classic Cold Coffee,119
+Signature Sips,Hot Chocolate,119
 Mojitos,Virgin Mojito,99
 Mojitos,Watermelon Mojito,109
-Mojitos,Blueberry Mojito,109
 Mojitos,Green Apple Mojito,109
-Mojitos,Cranberry Mojito,109
-Shakes,Butterscotch Milkshake,99
-Shakes,Butterscotch Thickshake,129
-Shakes,Dry Fruit Delight Milkshake,99
-Shakes,Dry Fruit Delight Thickshake,129
-Shakes,Chocolate Milkshake,109
-Shakes,Chocolate Thickshake,139
-Shakes,Oreo Milkshake,119
-Shakes,Oreo Thickshake,149
-Shakes,KitKat Milkshake,129
-Shakes,KitKat Thickshake,159
-Shakes,Rose Surprise Milkshake,129
-Shakes,Rose Surprise Thickshake,159
-Shakes,Premium Cranberry Milkshake,129
-Shakes,Premium Cranberry Thickshake,159
-Veg Combos,Love for Two (Veg),619
-Veg Combos,Sweet Escape,99
+Mojitos,Blueberry Mojito,119
+Mojitos,Cranberry Mojito,119
+Mojitos,Cola Blast Mojito,129
+Shakes,Choco Chaos,139
+Shakes,Butterscotch Bliss,149
+Shakes,Oreo Overload,149
+Shakes,KitKat Crunch,159
+Shakes,Rose Surprise,159
+Shakes,Cranberry Crush,159
+Shakes,Hazelnut Heaven,169
+Shakes,Dry Fruit Royale,179
+Scoop Shots,Vanilla Scoops,79
+Scoop Shots,Butterscotch Scoops,89
+Scoop Shots,Chocolate Scoops,99
 Veg Combos,Chai & Crunch (Veg),129
-Veg Combos,Maggi Mania (Veg),169
 Veg Combos,Momo Love (Veg),169
-Veg Combos,Burger Buddy (Veg),179
-Veg Combos,Shake & Bake,189
-Veg Combos,Soup & Starter (Veg),209
-Veg Combos,Sandwich Trio (Veg),229
-Veg Combos,Cafe Feast (Veg),279
+Veg Combos,Maggi Mania (Veg),199
+Veg Combos,Burger Buddy (Veg),199
+Veg Combos,Soup & Starter (Veg),229
+Veg Combos,Sandwich Trio (Veg),239
+Veg Combos,Cafe Feast (Veg),289
 Veg Combos,Momo Madness (Veg),289
 Veg Combos,Wok Meal (Veg),369
-Non-Veg Combos,Love for Two (Chicken),649
+Veg Combos,Love for Two (Veg),679
 Non-Veg Combos,Chai & Crunch (Chicken),129
 Non-Veg Combos,Momo Love (Chicken),189
-Non-Veg Combos,Burger Buddy (Chicken),199
-Non-Veg Combos,Maggi Mania (Chicken),209
-Non-Veg Combos,Soup & Starter (Chicken),249
-Non-Veg Combos,The Desi Combo,219
-Non-Veg Combos,Sandwich Trio (Chicken),229
-Non-Veg Combos,The Classic Meal,299
+Non-Veg Combos,Burger Buddy (Chicken),209
+Non-Veg Combos,Maggi Mania (Chicken),239
+Non-Veg Combos,Sandwich Trio (Chicken),239
+Non-Veg Combos,Soup & Starter (Chicken),269
 Non-Veg Combos,Cafe Feast (Chicken),309
 Non-Veg Combos,Momo Madness (Chicken),309
-Non-Veg Combos,Wok Meal (Chicken),439
+Non-Veg Combos,The Classic Meal,309
+Non-Veg Combos,Wok Meal (Chicken),429
+Non-Veg Combos,Love for Two (Chicken),719

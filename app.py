@@ -110,6 +110,59 @@ def init(con):
             with open(RES / "menu.csv", encoding="utf-8") as f:
                 con.executemany("INSERT INTO items(category, name, price) VALUES(?, ?, ?)",
                                 [(r["category"], r["name"], paise(r["price"])) for r in csv.DictReader(f)])
+    menu_update_2026_11(con)
+
+
+# One-time move to the menu of 22 Nov 2026 (menu.csv) for cafés still on the old Guns & Roses menu.
+# Runs once per database; items the café added itself (e.g. bottled drinks) are left alone.
+MENU_RENAMED = {
+    "Classic Veg Burger (Dip)": "Classic Veg Burger (Cheese Bomb)", "Paneer Burger (Dip)": "Paneer Burger (Cheese Bomb)",
+    "Classic Chicken Burger (Dip)": "Classic Chicken Burger (Cheese Bomb)",
+    "Crispy Chicken Burger (Dip)": "Crispy Chicken Burger (Cheese Bomb)",
+    "Quick Bites Veg Platter": "Veg Quick Bites Platter", "Quick Bites Non-Veg Platter": "Non-Veg Quick Bites Platter",
+    "Royal Apricot Bliss": "Apricot Delight", "Red Sauce Pasta": "Veg Arrabbiata Pasta", "White Sauce Pasta": "Veg Alfredo Pasta"}
+MENU_DROPPED = (
+    "Bombay Velvet", "Maska Bun", "Nutella Bun", "Cheese Garlic Bread", "Baby Corn Manchurian", "Chocolate Ammunition",
+    "Butterscotch Milkshake", "Butterscotch Thickshake", "Dry Fruit Delight Milkshake", "Dry Fruit Delight Thickshake",
+    "Chocolate Milkshake", "Chocolate Thickshake", "Oreo Milkshake", "Oreo Thickshake", "KitKat Milkshake",
+    "KitKat Thickshake", "Rose Surprise Milkshake", "Rose Surprise Thickshake", "Premium Cranberry Milkshake",
+    "Premium Cranberry Thickshake", "Sweet Escape", "Shake & Bake", "The Desi Combo")
+
+
+def menu_update_2026_11(con):
+    if con.execute("SELECT 1 FROM settings WHERE key = 'menu_2026_11'").fetchone():
+        return  # already done (or skipped) on this database
+    old = con.execute("SELECT 1 FROM items WHERE active = 1 AND name = 'Classic Veg Burger (Dip)'").fetchone()
+    if not old:  # a fresh install already has the new menu; another café's own menu is never touched
+        with con:
+            con.execute("INSERT INTO settings VALUES('menu_2026_11', 'skipped')")
+        return
+    path = con.execute("PRAGMA database_list").fetchone()[2]
+    if path:  # safety copy next to pos.db, taken before anything changes
+        bak = sqlite3.connect(path + datetime.now().strftime(".before-menu-%Y%m%d-%H%M%S.bak"))
+        con.backup(bak)
+        bak.close()
+    with open(RES / "menu.csv", encoding="utf-8") as f:
+        target = [(r["category"], r["name"], paise(r["price"])) for r in csv.DictReader(f)]
+    back = {new: old_name for old_name, new in MENU_RENAMED.items()}
+    n = {"changed": 0, "added": 0, "removed": 0}
+    with con:
+        for cat, name, price in target:
+            r = con.execute("SELECT id, category, name, price FROM items WHERE active = 1 AND name IN (?, ?) "
+                            "ORDER BY name = ? DESC, id LIMIT 1", (name, back.get(name, name), name)).fetchone()
+            if not r:
+                con.execute("INSERT INTO items(name, category, price) VALUES(?, ?, ?)", (name, cat, price))
+                n["added"] += 1
+            elif (r["category"], r["name"], r["price"]) != (cat, name, price):
+                con.execute("UPDATE items SET category = ?, name = ?, price = ? WHERE id = ?", (cat, name, price, r["id"]))
+                n["changed"] += 1
+        n["removed"] = con.execute(f"UPDATE items SET active = 0 WHERE active = 1 AND name IN "
+                                   f"({','.join('?' * len(MENU_DROPPED))})", MENU_DROPPED).rowcount
+        con.execute("INSERT INTO settings VALUES('menu_2026_11', 'done')")
+        con.execute("INSERT INTO audit(at, day, role, who, action, detail) VALUES(?, ?, 'system', 'Update', 'menu_save', ?)",
+                    (now(), business_day(con), "New menu of 22 Nov 2026: {changed} changed, {added} added, "
+                     "{removed} removed (backup kept next to pos.db)".format(**n)))
+    log.info("Menu updated to 22 Nov 2026: %(changed)s changed, %(added)s added, %(removed)s removed", n)
 
 
 def now():
@@ -1022,7 +1075,8 @@ def header(t, s):
 
 
 def bill_ticket(b, s, w):
-    t = header(Ticket(w, s.get("dark", "1") == "1"), s).line("TAX INVOICE", bold=True, center=True)
+    taxed = bool(b["cgst"] or b["sgst"] or Decimal(b["tax_pct"] or 0))
+    t = header(Ticket(w, s.get("dark", "1") == "1"), s).line("TAX INVOICE" if taxed else "BILL", bold=True, center=True)
     if b.get("voided"):
         t.line("*** VOID - NOT PAYABLE ***", bold=True, center=True)
     t.rule()
@@ -1039,8 +1093,9 @@ def bill_ticket(b, s, w):
     t.rule().row("Subtotal", amt(b["subtotal"]))
     if b["discount"]:
         t.row(f"Discount ({b['discount_pct']}%)" if Decimal(b["discount_pct"] or 0) else "Discount", amt(-b["discount"]))
-    h = Decimal(b["tax_pct"]) / 2
-    t.row(f"CGST @ {h}%", amt(b["cgst"])).row(f"SGST @ {h}%", amt(b["sgst"]))
+    h = Decimal(b["tax_pct"] or 0) / 2
+    if taxed:  # GST 0% (not registered): no tax lines on the receipt
+        t.row(f"CGST @ {h}%", amt(b["cgst"])).row(f"SGST @ {h}%", amt(b["sgst"]))
     if b["round_off"]:
         t.row("Round off", amt(b["round_off"]))
     t.rule().row("TOTAL Rs.", amt(b["total"]), bold=True).rule()
@@ -1060,7 +1115,8 @@ def day_ticket(r, s, w):
     t.line(("Day still open" if r["open"] else "Day closed") + " - printed " + datetime.now().strftime("%d/%m %I:%M %p"), center=True)
     t.rule().row("Bills", r["count"]).row("Cancelled orders", r["cancelled"]).rule()
     t.row("Gross", amt(sm["subtotal"])).row("Discounts", amt(-sm["discount"]))
-    t.row(f"CGST @ {h}%", amt(sm["cgst"])).row(f"SGST @ {h}%", amt(sm["sgst"]))
+    if sm["cgst"] or sm["sgst"]:
+        t.row(f"CGST @ {h}%", amt(sm["cgst"])).row(f"SGST @ {h}%", amt(sm["sgst"]))
     if sm["round_off"]:  # only bills from before v4 have a round-off
         t.row("Round off", amt(sm["round_off"]))
     if r.get("voided", {}).get("count"):
@@ -1359,6 +1415,20 @@ def selftest():
         assert "TAX INVOICE" in txt and "Birthday Cake" in txt and "Guns & Roses Cafe" in txt
         assert amt(b2["total"]) in txt and "Discount" in txt
     assert b"NET SALES" in day_ticket(report(con, {"day": [b2["day"]]}), s, 32)
+    # GST 0% (not registered): total = menu price, and the receipt has no tax lines
+    con.commit()
+    con.execute("SAVEPOINT gst0")  # rolled back below: later checks count today's bills
+    if True:
+        con.execute("UPDATE settings SET value = '0' WHERE key = 'tax_pct'")
+        o0 = new_order(con, {"type": "takeaway"})["id"]
+        send_kot(con, {"order_id": o0, "lines": [{"id": pid, "qty": 1}]})
+        b0 = bill_order(con, {"order_id": o0, "payment": "UPI"})
+        assert (b0["cgst"], b0["sgst"], b0["total"]) == (0, 0, b0["subtotal"])
+        txt0 = bill_ticket(b0, settings(con), 32).decode("ascii", "ignore")
+        assert "CGST" not in txt0 and "TAX INVOICE" not in txt0 and "BILL" in txt0
+    con.execute("ROLLBACK TO gst0")
+    con.execute("RELEASE gst0")
+    assert settings(con)["tax_pct"] == s["tax_pct"]
     # phone printing (RawBT) needs no COM port and gets the same receipt bytes back
     assert base64.b64decode(print_job(con, {"bill": b2["id"], "phone": True})["escpos"]) == bill_ticket(b2, settings(con), 32)
     # dark printing (default on): double-strike + bold everywhere; off: plain

@@ -618,7 +618,7 @@ $('#billBtn').onclick = () => once(async () => {
   if (!await sendKot() || !online) return alert('No connection to the POS - the items are queued for the kitchen, but billing needs the connection. Try again in a moment.');
   if (!cur) return;
   discMode = '%'; $('#bdisc').value = 0; $('#billTitle').textContent = 'Bill · ' + orderTitle(cur);
-  picked = new Set(cur.lines.map(l => l.id)); pays = [{method: 'Cash', amount: 0}];
+  picked = new Set(cur.lines.map(l => l.id)); pays = [{method: 'UPI', amount: 0}];  // most customers pay by UPI
   $('#splitBox').open = false;
   $('#billLines').innerHTML = cur.lines.map(l => `<label><input type="checkbox" data-line="${l.id}" checked> ${l.qty} × ${esc(l.name)}
       <span style="margin-left:auto">${money(l.qty * l.price)}</span></label>`).join('');
@@ -632,7 +632,7 @@ function renderBill() {
   if (pays.length === 1) pays[0].amount = t.total;
   $('#bsum').innerHTML = (picked.size < cur.lines.length ? `<div class="mute">${picked.size} of ${cur.lines.length} items</div>` : '')
     + row('Subtotal', money(t.sub)) + (t.dis ? row(discMode === '%' ? `Discount ${v}%` : 'Discount', '−' + money(t.dis)) : '')
-    + row(`CGST ${h}%`, money(t.cgst)) + row(`SGST ${h}%`, money(t.sgst)) + (t.ro ? row('Round off', money(t.ro)) : '')
+    + (h ? row(`CGST ${h}%`, money(t.cgst)) + row(`SGST ${h}%`, money(t.sgst)) : '') + (t.ro ? row('Round off', money(t.ro)) : '')
     + row('Total', money(t.total), 'big');
   payLeft();
 }
@@ -669,13 +669,13 @@ $('#payRows').oninput = e => {
 $('#payRows').onclick = e => { const i = e.target.closest('[data-rm]')?.dataset.rm; if (i !== undefined) { pays.splice(+i, 1); renderPays() } };
 $('#addPay').onclick = () => {
   const left = billTotal - pays.reduce((a, p) => a + p.amount, 0);
-  if (pays.length === 1) { pays[0].amount = 0; pays.push({method: 'UPI', amount: billTotal}) }  // e.g. type the cash, UPI takes the rest
+  if (pays.length === 1) { pays[0].amount = 0; if (pays[0].method === 'UPI') pays[0].method = 'Cash'; pays.push({method: 'UPI', amount: billTotal}) }  // e.g. type the cash, UPI takes the rest
   else pays.push({method: 'UPI', amount: Math.max(left, 0)});
   renderPays(); $('#payRows input')?.focus();
 };
 document.querySelectorAll('[data-eq]').forEach(b => b.onclick = () => {  // one bill, each person pays an equal share
   const n = +b.dataset.eq, share = Math.floor(billTotal / n);  // the last person pays the odd paise
-  pays = Array.from({length: n}, (_, i) => ({method: pays[i]?.method || 'Cash', amount: i < n - 1 ? share : billTotal - share * (n - 1)}));
+  pays = Array.from({length: n}, (_, i) => ({method: pays[i]?.method || 'UPI', amount: i < n - 1 ? share : billTotal - share * (n - 1)}));
   renderPays();
 });
 $('#billLines').onchange = e => {
@@ -723,12 +723,12 @@ function printReceipt(b) {
   $('#receipt').innerHTML = `<div class="c"><b class="big">${esc(S.name)}</b>`
     + (S.address ? '<br>' + esc(S.address) : '') + (S.phone ? '<br>Ph: ' + esc(S.phone) : '')
     + (S.gstin ? '<br>GSTIN: ' + esc(S.gstin) : '') + (S.fssai ? '<br>FSSAI: ' + esc(S.fssai) : '')
-    + '<br><b>TAX INVOICE</b>' + (b.voided ? '<br><b>*** VOID - NOT PAYABLE ***</b>' : '') + '</div><hr>'
+    + (h ? '<br><b>TAX INVOICE</b>' : '<br><b>BILL</b>') + (b.voided ? '<br><b>*** VOID - NOT PAYABLE ***</b>' : '') + '</div><hr>'
     + row('Bill No: ' + esc(b.bill_label), when) + row(TYPE[b.type] + (b.table_no ? ' · Table ' + b.table_no : ''), 'Paid: ' + esc(b.payment))
     + (b.customer || b.phone ? `<div>${esc(b.customer)} ${esc(b.phone)}</div>` : '') + (b.address ? `<div>${esc(b.address)}</div>` : '')
     + '<hr>' + b.lines.map(l => row(`${esc(l.name)}<br>&nbsp; ${l.qty} × ${money(l.price)}`, money(l.qty * l.price))).join('')
     + '<hr>' + row('Subtotal', money(b.subtotal)) + (b.discount ? row(+b.discount_pct ? `Discount (${b.discount_pct}%)` : 'Discount', '−' + money(b.discount)) : '')
-    + row(`CGST @ ${h}%`, money(b.cgst)) + row(`SGST @ ${h}%`, money(b.sgst)) + (b.round_off ? row('Round off', money(b.round_off)) : '')
+    + (h ? row(`CGST @ ${h}%`, money(b.cgst)) + row(`SGST @ ${h}%`, money(b.sgst)) : '') + (b.round_off ? row('Round off', money(b.round_off)) : '')
     + '<hr>' + row('TOTAL', money(b.total), 'big')
     + ((b.payments || []).length > 1 ? '<hr>' + b.payments.map(p => row('Paid ' + esc(p.method), money(p.amount))).join('') : '')
     + `<hr><div class="c">${esc(S.footer)}</div>`;
@@ -841,7 +841,7 @@ function printDayReport(r) {  // end-of-day report (Z report)
     + `<br>${r.open ? 'Day still open' : 'Day closed'} · printed ${new Date().toLocaleString('en-IN', {dateStyle: 'short', timeStyle: 'short'})}</div><hr>`
     + row('Bills', r.count) + row('Cancelled orders', r.cancelled) + '<hr>'
     + row('Gross (before discount)', money(s.subtotal)) + row('Discounts', '−' + money(s.discount))
-    + row(`CGST @ ${h}%`, money(s.cgst)) + row(`SGST @ ${h}%`, money(s.sgst)) + (s.round_off ? row('Round off', money(s.round_off)) : '')
+    + (s.cgst || s.sgst ? row(`CGST @ ${h}%`, money(s.cgst)) + row(`SGST @ ${h}%`, money(s.sgst)) : '') + (s.round_off ? row('Round off', money(s.round_off)) : '')
     + (r.voided?.count ? row(`Voided bills (${r.voided.count})`, money(r.voided.total)) : '')
     + (r.refunds ? row('Bills total', money(s.total)) + row('Refunds', '−' + money(r.refunds)) : '')
     + '<hr>' + row('NET SALES', money(r.net ?? s.total), 'big') + '<hr><b>By payment</b>'
@@ -879,7 +879,7 @@ $('#itemForm').onsubmit = e => {
 
 // ---------- settings ----------
 const FIELDS = [['name', 'Restaurant name'], ['address', 'Address'], ['phone', 'Phone'], ['gstin', 'GSTIN'],
-  ['fssai', 'FSSAI licence no. (required on bills)'], ['tax_pct', 'GST % (split equally into CGST + SGST)'],
+  ['fssai', 'FSSAI licence no. (required on bills)'], ['tax_pct', 'GST % (split equally into CGST + SGST). 0 = no GST: bills are the menu prices and receipts show no GST lines'],
   ['tables', 'Number of dine-in tables'], ['footer', 'Receipt footer'],
   ['printer', 'Receipt printer (USB: plug it into the counter PC and press Connect in the CafePOS window; Bluetooth: pair it first)'],
   ['paper', 'Paper width'], ['dark', 'Print darkness'],
