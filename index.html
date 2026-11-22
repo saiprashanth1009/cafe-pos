@@ -881,12 +881,14 @@ $('#itemForm').onsubmit = e => {
 const FIELDS = [['name', 'Restaurant name'], ['address', 'Address'], ['phone', 'Phone'], ['gstin', 'GSTIN'],
   ['fssai', 'FSSAI licence no. (required on bills)'], ['tax_pct', 'GST % (split equally into CGST + SGST)'],
   ['tables', 'Number of dine-in tables'], ['footer', 'Receipt footer'],
-  ['printer', 'Receipt printer (pair a Bluetooth printer with the counter PC first)'], ['paper', 'Paper width'],
+  ['printer', 'Receipt printer (USB: plug it into the counter PC and press Connect in the CafePOS window; Bluetooth: pair it first)'],
+  ['paper', 'Paper width'], ['dark', 'Print darkness'],
   ['owner_pin', 'New OWNER PIN, 6+ digits (blank = keep current). Only the owner can then change the menu, give discounts, cancel/void/refund, close the day and see reports.'],
   ['pin', 'New STAFF PIN, 6+ digits (blank = keep current). Staff take orders, bill and run the kitchen.']];
 const PINS = ['pin', 'owner_pin'];
 const fieldInput = k => k === 'printer' ? '<select name="printer"><option value="">No printer - use the print dialog</option></select>'
   : k === 'paper' ? '<select name="paper"><option value="58">58 mm (2 inch)</option><option value="80">80 mm (3 inch)</option></select>'
+  : k === 'dark' ? '<select name="dark"><option value="1">Dark (bold) - easier to read on small printers</option><option value="0">Normal</option></select>'
   : `<input name="${k}" ${PINS.includes(k) ? 'type="password" inputmode="numeric"' : ''} autocomplete="off">`;
 $('#setForm').innerHTML = FIELDS.map(([k, l]) => `<label>${l}${fieldInput(k)}</label>`).join('')
   + '<p class="mute" style="margin:0;font-size:14px">Tablet name and "print from this phone" are under ⚙ at the top right, on each tablet.</p>'
@@ -895,7 +897,7 @@ $('#setForm').innerHTML = FIELDS.map(([k, l]) => `<label>${l}${fieldInput(k)}</l
 $('#testPrint').onclick = () => {
   if (phonePrint()) return directPrint({test: true});
   if (!S.printer) return alert('Choose the printer above (or tick "Print from this phone") and press Save settings first.');
-  once(async () => { await api('/api/print', {test: true}); alert(`Test page sent to ${S.printer}.`) });
+  once(async () => { await api('/api/print', {test: true}); alert(`Test page sent to ${S.printer.replace(/^WIN:/, '')}.`) });
 };
 $('#backupBtn').onclick = () => once(async () => {
   const r = await fetch('/api/backup', {headers: {'X-Pin': pin, ...(PROFILE ? {'X-Profile': PROFILE} : {})}});
@@ -907,12 +909,15 @@ function renderSettings() {
   const f = $('#setForm');
   for (const [k] of FIELDS) if (k !== 'printer') f.elements[k].value = PINS.includes(k) ? '' : S[k] ?? '';
   PINS.forEach(k => f.elements[k].closest('label').hidden = PROFILES_ON);  // with profiles, PINs live in Profiles
-  api('/api/printers').then(r => {  // COM ports on the counter PC; Bluetooth printers get one when paired
-    const ports = r.ports.map(p => p.port);
-    if (S.printer && !ports.includes(S.printer)) ports.push(S.printer);  // saved one, even if unpaired right now
-    f.elements.printer.innerHTML = '<option value="">No printer - use the print dialog</option>'
-      + ports.map(p => { const x = r.ports.find(x => x.port === p) || {};
-        return `<option value="${esc(p)}">${esc(p)}${x.name ? ' - ' + esc(x.name) : x.bluetooth ? ' (Bluetooth)' : ''}</option>` }).join('');
+  api('/api/printers').then(r => {  // printers installed in Windows (USB) + COM ports (Bluetooth printers get one when paired)
+    const opts = [['', 'No printer - use the print dialog']];
+    for (const w of r.windows || []) {
+      if (/PDF|XPS|OneNote|Fax/i.test(w.name)) continue;  // virtual printers can't take receipt bytes
+      opts.push(['WIN:' + w.name, `${w.name} (${w.port})${w.connected === false ? ' - not plugged in' : w.connected ? ' - connected' : ''}${w.default ? ' - default' : ''}`]);
+    }
+    for (const p of r.ports) opts.push([p.port, `${p.port}${p.name ? ' - ' + p.name : p.bluetooth ? ' (Bluetooth)' : ''}`]);
+    if (S.printer && !opts.some(o => o[0] === S.printer)) opts.push([S.printer, S.printer.replace(/^WIN:/, '') + ' (not found right now)']);
+    f.elements.printer.innerHTML = opts.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join('');
     f.elements.printer.value = S.printer || '';
   }).catch(() => {});
 }

@@ -22,7 +22,9 @@ TYPES = ("dine_in", "takeaway", "delivery")
 PAYMENTS = ("Cash", "UPI", "Card")
 DEFAULT_SETTINGS = {"name": "Guns & Roses Café", "address": "Kondapur, Hyderabad", "phone": "", "gstin": "", "fssai": "",
                     "tax_pct": "5", "tables": "8", "footer": "Thank you! Visit again.",
-                    "printer": "", "paper": "58",  # printer: "" = tablet's print dialog, else COM port of a thermal printer
+                    # printer: "" = tablet's print dialog, "COM5" = Bluetooth printer, "WIN:<name>" = Windows (USB) printer
+                    "printer": "", "paper": "58",
+                    "dark": "1",  # bold + double-strike every line: cheap 58 mm printers print very faint otherwise
                     "pin": os.environ.get("POS_PIN") or "1234",  # staff PIN; set POS_PIN when hosting so a fresh site never has 1234
                     "owner_pin": os.environ.get("POS_OWNER_PIN") or ""}  # blank = the staff PIN also has owner rights
 SECRET_SETTINGS = ("pin", "owner_pin", "pin_key")
@@ -410,8 +412,11 @@ def save_settings(con, d):
     staff, owner = str(d.get("pin") or old["pin"]), str(d.get("owner_pin") or old.get("owner_pin") or "")
     if owner and owner == staff:
         raise ValueError("the owner PIN must be different from the staff PIN")
-    if d.get("printer") and not PORT_RE.fullmatch(str(d["printer"])):  # only COM ports, never a file path
-        raise ValueError("printer must be a COM port like COM5")
+    # only a COM port or a printer installed in Windows, never a file path
+    if d.get("printer") and not valid_printer(str(d["printer"])):
+        raise ValueError("printer must be a COM port like COM5 or a printer installed in Windows")
+    if "dark" in d and str(d["dark"]) not in ("0", "1"):
+        raise ValueError("dark must be 0 or 1")
     if "paper" in d and d["paper"] not in ("58", "80"):
         raise ValueError("paper must be 58 or 80 mm")
     changed = []
@@ -746,33 +751,191 @@ def backup(con, q):
     return data
 
 
-# ---------------- direct printing: ESC/POS thermal printer on a COM port (Bluetooth or USB) ----------------
+# ---------------- direct printing: ESC/POS thermal printer ----------------
+# The "printer" setting is either a COM port ("COM5": Bluetooth printer paired with this PC) or a Windows printer
+# ("WIN:EZO Printer": a USB printer installed in Windows, sent RAW so the ESC/POS bytes reach it unchanged).
 PORT_RE = re.compile(r"COM\d{1,3}")
+WIN_PREFIX = "WIN:"
 PRINT_LOCK = threading.Lock()
+USBPRINT_IFACE = r"SYSTEM\CurrentControlSet\Control\DeviceClasses\{28d78fad-5a12-11d1-ae5b-0000f803a8c2}"
 
 
 class PrinterError(Exception):
     pass
 
 
-def printer_ports(con=None, q=None):
+def com_ports():
     """COM ports Windows knows about; Bluetooth printers show up as \\Device\\BthModemN."""
     try:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DEVICEMAP\SERIALCOMM")
     except (ImportError, OSError):
-        return {"ports": []}  # not Windows, or no COM ports
-    ports, i = [], 0
+        return []  # not Windows, or no COM ports
+    ports, i, names = [], 0, bt_names(winreg)
     while True:
         try:
             dev, port, _ = winreg.EnumValue(key, i)
         except OSError:
             break
-        ports.append({"port": port, "bluetooth": "Bth" in dev, "name": bt_names(winreg).get(port, "")})
+        ports.append({"port": port, "bluetooth": "Bth" in dev, "name": names.get(port, "")})
         i += 1
     # an "incoming" Bluetooth port (no device behind it) can never be a printer
     ports = [p for p in ports if not (p["bluetooth"] and p["name"] == "incoming")]
-    return {"ports": sorted(ports, key=lambda p: int(p["port"][3:]) if p["port"][3:].isdigit() else 0)}
+    return sorted(ports, key=lambda p: int(p["port"][3:]) if p["port"][3:].isdigit() else 0)
+
+
+def present_usb_printers():
+    """Device paths of USB printers plugged in right now, lower-case, e.g. '\\\\?\\usb#vid_28e9&pid_0289#...#{28d78fad-...}'."""
+    try:
+        import ctypes, uuid
+        cm = ctypes.WinDLL("cfgmgr32.dll")
+        cm.CM_Get_Device_Interface_ListW, cm.CM_Get_Device_Interface_List_SizeW
+    except (ImportError, OSError, AttributeError):
+        return set()
+    guid = (ctypes.c_byte * 16).from_buffer_copy(uuid.UUID("28d78fad-5a12-11d1-ae5b-0000f803a8c2").bytes_le)
+    size = ctypes.c_ulong()
+    if cm.CM_Get_Device_Interface_List_SizeW(ctypes.byref(size), ctypes.byref(guid), None, 0) or size.value < 2:
+        return set()
+    buf = ctypes.create_unicode_buffer(size.value)
+    if cm.CM_Get_Device_Interface_ListW(ctypes.byref(guid), None, buf, size, 0):  # 0 = present devices only
+        return set()
+    return {p.lower() for p in ctypes.wstring_at(ctypes.addressof(buf), size.value).split("\0") if p}
+
+
+def usb_printer_ports():
+    """USB printers Windows has seen: {"USB001": {"present": True, "desc": "UnknownPrinter"}}.
+    present = plugged in right now."""
+    out = {}
+    try:
+        import winreg
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, USBPRINT_IFACE)
+    except (ImportError, OSError):
+        return out
+    live = present_usb_printers()
+    for i in range(256):
+        try:
+            sub = winreg.EnumKey(root, i)  # "##?#USB#VID_28E9&PID_0289#000000000004#{28d78fad-...}"
+        except OSError:
+            break
+        try:
+            k = winreg.OpenKey(root, sub + r"\#\Device Parameters")
+            port = "%s%03d" % (winreg.QueryValueEx(k, "Base Name")[0], winreg.QueryValueEx(k, "Port Number")[0])
+            try:
+                desc = winreg.QueryValueEx(k, "Port Description")[0]
+            except OSError:
+                desc = ""
+            present = ("\\\\?\\" + sub[4:]).lower() in live
+            if port not in out or present:
+                out[port] = {"present": present, "desc": desc}
+        except OSError:
+            continue
+    return out
+
+
+def _winspool():
+    import ctypes
+    from ctypes import wintypes
+    ws = ctypes.WinDLL("winspool.drv", use_last_error=True)
+    ws.OpenPrinterW.argtypes = [wintypes.LPWSTR, ctypes.POINTER(wintypes.HANDLE), ctypes.c_void_p]
+    ws.StartDocPrinterW.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p]
+    ws.WritePrinter.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    for f in (ws.ClosePrinter, ws.EndDocPrinter, ws.StartPagePrinter, ws.EndPagePrinter):
+        f.argtypes = [wintypes.HANDLE]
+    ws.EnumPrintersW.argtypes = [wintypes.DWORD, wintypes.LPWSTR, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                 ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD)]
+    ws.GetDefaultPrinterW.argtypes = [wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    ws.SetDefaultPrinterW.argtypes = [wintypes.LPWSTR]
+    return ctypes, wintypes, ws
+
+
+def windows_printers():
+    """Printers installed in Windows: [{"name", "port", "default", "connected"}]. connected is True/False for USB
+    and COM ports, None for virtual ones (Print to PDF...)."""
+    try:
+        ctypes, wintypes, ws = _winspool()
+    except (ImportError, OSError, AttributeError):
+        return []
+
+    class PI5(ctypes.Structure):  # PRINTER_INFO_5W
+        _fields_ = [("pPrinterName", wintypes.LPWSTR), ("pPortName", wintypes.LPWSTR), ("Attributes", wintypes.DWORD),
+                    ("DeviceNotSelectedTimeout", wintypes.DWORD), ("TransmissionRetryTimeout", wintypes.DWORD)]
+    flags = 0x2 | 0x4  # PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS
+    need, count = wintypes.DWORD(), wintypes.DWORD()
+    ws.EnumPrintersW(flags, None, 5, None, 0, ctypes.byref(need), ctypes.byref(count))
+    if not need.value:
+        return []
+    buf = ctypes.create_string_buffer(need.value)
+    if not ws.EnumPrintersW(flags, None, 5, buf, need, ctypes.byref(need), ctypes.byref(count)):
+        return []
+    default = default_printer()
+    usb, coms = usb_printer_ports(), {p["port"] for p in com_ports()}
+    out = []
+    for p in ctypes.cast(buf, ctypes.POINTER(PI5))[:count.value]:
+        port = (p.pPortName or "").rstrip(":")
+        connected = usb[port]["present"] if port in usb else (port in coms) if PORT_RE.fullmatch(port) else None
+        if p.Attributes & 0x400:  # PRINTER_ATTRIBUTE_WORK_OFFLINE ("Use printer offline")
+            connected = False
+        out.append({"name": p.pPrinterName, "port": port, "default": p.pPrinterName == default, "connected": connected})
+    return sorted(out, key=lambda p: (not p["default"], p["name"].lower()))
+
+
+def default_printer():
+    try:
+        ctypes, wintypes, ws = _winspool()
+    except (ImportError, OSError, AttributeError):
+        return ""
+    n = wintypes.DWORD(0)
+    ws.GetDefaultPrinterW(None, ctypes.byref(n))
+    if not n.value:
+        return ""
+    buf = ctypes.create_unicode_buffer(n.value)
+    return buf.value if ws.GetDefaultPrinterW(buf, ctypes.byref(n)) else ""
+
+
+def set_default_printer(name):
+    """Make a printer the Windows default, and stop Windows 11 from switching it to 'the last one used'."""
+    ctypes, wintypes, ws = _winspool()
+    try:
+        import winreg
+        k = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows NT\CurrentVersion\Windows")
+        winreg.SetValueEx(k, "LegacyDefaultPrinterMode", 0, winreg.REG_DWORD, 1)
+    except OSError:
+        pass
+    if not ws.SetDefaultPrinterW(name):
+        raise PrinterError(f"Windows would not make '{name}' the default printer (error {ctypes.get_last_error()})")
+
+
+def printer_ports(con=None, q=None):
+    """Everything the Settings printer list can offer: COM ports and Windows printers."""
+    return {"ports": com_ports(), "windows": windows_printers()}
+
+
+def printer_label(target):
+    return target[len(WIN_PREFIX):] if target.startswith(WIN_PREFIX) else target
+
+
+def printer_status(target):
+    """(connected: True/False/None, text) for the printer the POS prints to."""
+    if not target:
+        return None, "No printer chosen - bills use the tablet's print dialog"
+    if PORT_RE.fullmatch(target):
+        p = next((p for p in com_ports() if p["port"] == target), None)
+        if not p:
+            return False, f"{target} - not paired with this PC"
+        return True, f"{target}{' - ' + p['name'] if p['name'] else ''} (Bluetooth, connects when printing)"
+    name = printer_label(target)
+    p = next((p for p in windows_printers() if p["name"] == name), None)
+    if not p:
+        return False, f"{name} - not installed in Windows"
+    if p["connected"] is False:
+        return False, f"{name} ({p['port']}) - not plugged in / switched off"
+    return True, f"{name} ({p['port']}) - connected" + (", Windows default" if p["default"] else "")
+
+
+def valid_printer(v):
+    if PORT_RE.fullmatch(v):
+        return True
+    return v.startswith(WIN_PREFIX) and any(p["name"] == v[len(WIN_PREFIX):] for p in windows_printers())
 
 
 def bt_names(winreg):
@@ -812,6 +975,9 @@ def bt_names(winreg):
     return out
 
 
+ESC_CODES = rb"\x1b@|\x1b[aEdG].?|\x1d[!V].?"  # the ESC/POS codes Ticket writes (tests strip them to check the text)
+
+
 def amt(p):
     return ("-" if p < 0 else "") + f"{abs(p) / 100:,.2f}"
 
@@ -819,13 +985,16 @@ def amt(p):
 class Ticket:
     """Plain-text receipt for 58 mm (32 columns) or 80 mm (48 columns) ESC/POS printers."""
 
-    def __init__(self, width):
-        self.w, self.out = width, bytearray(b"\x1b@")  # ESC @ = reset printer
+    def __init__(self, width, dark=False):
+        self.w, self.out, self.dark = width, bytearray(b"\x1b@"), dark  # ESC @ = reset printer
+        if dark:
+            self.out += b"\x1bG\x01"  # ESC G 1 = double-strike: every dot printed twice, much darker on faint printers
 
     def line(self, s="", bold=False, center=False, big=False):
         s = unicodedata.normalize("NFKD", str(s).replace("₹", "Rs.").replace("−", "-").replace("×", "x"))
         s = s.encode("ascii", "ignore")  # printer fonts are ASCII; "Café" -> "Cafe"
         big = big and len(s) <= self.w // 2  # double size only if it still fits on one line
+        bold = bold or self.dark
         self.out += b"\x1ba" + (b"\x01" if center else b"\x00") + b"\x1bE" + (b"\x01" if bold else b"\x00")
         self.out += b"\x1d!" + (b"\x11" if big else b"\x00") + s + b"\n"
         return self
@@ -853,7 +1022,7 @@ def header(t, s):
 
 
 def bill_ticket(b, s, w):
-    t = header(Ticket(w), s).line("TAX INVOICE", bold=True, center=True)
+    t = header(Ticket(w, s.get("dark", "1") == "1"), s).line("TAX INVOICE", bold=True, center=True)
     if b.get("voided"):
         t.line("*** VOID - NOT PAYABLE ***", bold=True, center=True)
     t.rule()
@@ -886,7 +1055,7 @@ def bill_ticket(b, s, w):
 
 def day_ticket(r, s, w):
     sm, h = r["sums"], Decimal(s["tax_pct"]) / 2
-    t = header(Ticket(w), s).line("DAILY SALES REPORT", bold=True, center=True)
+    t = header(Ticket(w, s.get("dark", "1") == "1"), s).line("DAILY SALES REPORT", bold=True, center=True)
     t.line(date.fromisoformat(r["day"]).strftime("%a %d %b %Y"), center=True)
     t.line(("Day still open" if r["open"] else "Day closed") + " - printed " + datetime.now().strftime("%d/%m %I:%M %p"), center=True)
     t.rule().row("Bills", r["count"]).row("Cancelled orders", r["cancelled"]).rule()
@@ -910,12 +1079,44 @@ def day_ticket(r, s, w):
     return t.rule().line("--- end of report ---", center=True).end(cut=w >= 48)
 
 
+def raw_print(name, data, doc="CafePOS"):
+    """Send ESC/POS bytes to a Windows printer as a RAW job: the driver passes them to the printer untouched."""
+    ctypes, wintypes, ws = _winspool()
+
+    class DOCINFO(ctypes.Structure):  # DOC_INFO_1W
+        _fields_ = [("pDocName", wintypes.LPWSTR), ("pOutputFile", wintypes.LPWSTR), ("pDatatype", wintypes.LPWSTR)]
+    h = wintypes.HANDLE()
+    if not ws.OpenPrinterW(name, ctypes.byref(h), None):
+        raise OSError(ctypes.get_last_error(), "printer not found")
+    try:
+        if not ws.StartDocPrinterW(h, 1, ctypes.byref(DOCINFO(doc, None, "RAW"))):
+            raise OSError(ctypes.get_last_error(), "the printer driver refused a RAW job")
+        try:
+            ws.StartPagePrinter(h)
+            done = wintypes.DWORD()
+            if not ws.WritePrinter(h, data, len(data), ctypes.byref(done)) or done.value != len(data):
+                raise OSError(ctypes.get_last_error(), "could not send the job")
+            ws.EndPagePrinter(h)
+        finally:
+            ws.EndDocPrinter(h)
+    finally:
+        ws.ClosePrinter(h)
+
+
 def send_to_printer(port, data, timeout=25):
-    """Write raw ESC/POS bytes to the printer's COM port; Bluetooth connects on open, so allow some seconds."""
+    """Write raw ESC/POS bytes to the printer: a COM port (Bluetooth connects on open, so allow some seconds)
+    or a Windows printer ("WIN:<name>", e.g. a USB thermal printer)."""
     err = []
+    if port.startswith(WIN_PREFIX):
+        connected, status = printer_status(port)
+        if connected is False:  # Windows would hold the job and print it whenever the printer comes back: surprising
+            raise PrinterError(f"{status}. Plug the printer in, switch it on and print again.")
 
     def run():
         try:
+            if port.startswith(WIN_PREFIX):
+                raw_print(printer_label(port), data)
+                return
             with open(rf"\\.\{port}", "wb", buffering=0) as f:
                 f.write(data)
         except OSError as e:
@@ -924,17 +1125,18 @@ def send_to_printer(port, data, timeout=25):
         th = threading.Thread(target=run, daemon=True)
         th.start()
         th.join(timeout)
+    where = printer_label(port)
     if th.is_alive():
-        raise PrinterError(f"The printer on {port} did not answer. Is it switched on, charged and near the PC?")
+        raise PrinterError(f"The printer {where} did not answer. Is it switched on, charged and near the PC?")
     if err:
-        raise PrinterError(f"Could not print on {port}: {err[0].strerror or err[0]}. Is the printer on and paired?")
+        raise PrinterError(f"Could not print on {where}: {err[0].strerror or err[0]}. Is the printer on and connected?")
 
 
 def print_job(con, d):
     s = settings(con)
     port, w = s.get("printer") or "", 32 if s.get("paper", "58") == "58" else 48
     phone = d.get("phone")  # the phone prints it itself (RawBT app); just hand back the ESC/POS bytes
-    if not phone and not PORT_RE.fullmatch(port):
+    if not phone and not (PORT_RE.fullmatch(port) or port.startswith(WIN_PREFIX)):
         raise ValueError("no printer chosen - pick one in Settings")
     if d.get("bill"):
         r = con.execute("SELECT * FROM orders WHERE id = ? AND status = 'billed'", (int(d["bill"]),)).fetchone()
@@ -947,15 +1149,24 @@ def print_job(con, d):
             raise Forbidden("The day report needs a profile that may see reports")
         data, what = day_ticket(report(con, {"day": [str(d["day"])]}), s, w), f"day report {d['day']}"
     elif d.get("test"):
-        t = header(Ticket(w), s).line("Printer test", bold=True, center=True).rule()
-        data, what = t.row("Paper", f"{s.get('paper')} mm").row("Port", port or "phone").row("Sample", amt(12345)).rule().end(w >= 48), "test page"
+        t = header(Ticket(w, s.get("dark", "1") == "1"), s).line("Printer test", bold=True, center=True).rule()
+        data, what = t.row("Paper", f"{s.get('paper')} mm").row("Printer", printer_label(port)[:w - 9] or "phone").row("Sample", amt(12345)).rule().end(w >= 48), "test page"
     else:
         raise ValueError("nothing to print")
     if phone:
         return {"escpos": base64.b64encode(data).decode()}
     send_to_printer(port, data)
-    log.info("Printed %s on %s", what, port)
+    log.info("Printed %s on %s", what, printer_label(port))
     return {"ok": True}
+
+
+def test_ticket(con):
+    """Test page bytes for the CafePOS window's 'Test print' button."""
+    s = settings(con)
+    w = 32 if s.get("paper", "58") == "58" else 48
+    t = header(Ticket(w, s.get("dark", "1") == "1"), s).line("Printer test", bold=True, center=True).rule()
+    t.row("Paper", f"{s.get('paper')} mm").row("Printer", printer_label(s.get("printer") or "")[:w - 9])
+    return t.row("Printed", datetime.now().strftime("%d/%m %I:%M %p")).rule().line("Printer is ready!", center=True).end(w >= 48)
 
 
 GET = {"/api/state": state, "/api/kitchen": kitchen, "/api/report": report, "/api/backup": backup,
@@ -1143,14 +1354,32 @@ def selftest():
     s = settings(con)
     for w in (32, 48):
         tk = bill_ticket(b2, s, w)
-        txt = re.sub(rb"\x1b[aE@d].?|\x1d[!V].?", b"", tk).decode()  # strip ESC/POS control codes
+        txt = re.sub(ESC_CODES, b"", tk).decode()  # strip ESC/POS control codes
         assert all(len(x) <= w for x in txt.splitlines()), [x for x in txt.splitlines() if len(x) > w]
         assert "TAX INVOICE" in txt and "Birthday Cake" in txt and "Guns & Roses Cafe" in txt
         assert amt(b2["total"]) in txt and "Discount" in txt
     assert b"NET SALES" in day_ticket(report(con, {"day": [b2["day"]]}), s, 32)
     # phone printing (RawBT) needs no COM port and gets the same receipt bytes back
     assert base64.b64decode(print_job(con, {"bill": b2["id"], "phone": True})["escpos"]) == bill_ticket(b2, settings(con), 32)
-    for bad in ("C:\\pos.db", "..\\x", "LPT1", "COM1;x"):
+    # dark printing (default on): double-strike + bold everywhere; off: plain
+    assert b"\x1bG\x01" in bill_ticket(b2, s, 32) and s["dark"] == "1"
+    assert b"\x1bG\x01" not in bill_ticket(b2, {**s, "dark": "0"}, 32)
+    # Windows (USB) printers: only ones that are really installed; an unknown one fails with a clear message
+    assert printer_status("")[0] is None and printer_label("WIN:EZO Printer") == "EZO Printer"
+    con.execute("UPDATE settings SET value = 'WIN:No Such Printer 123' WHERE key = 'printer'")
+    try:
+        print_job(con, {"test": True})
+        raise AssertionError("printed on a printer that isn't installed")
+    except PrinterError as e:
+        assert "not installed" in str(e), e
+    con.execute("UPDATE settings SET value = '' WHERE key = 'printer'")
+    installed = [p["name"] for p in windows_printers()]
+    if installed:  # on Windows: a real printer name is accepted, and the printer list includes it
+        save_settings(con, {"printer": WIN_PREFIX + installed[0]})
+        assert settings(con)["printer"] == WIN_PREFIX + installed[0]
+        assert installed[0] in [p["name"] for p in printer_ports()["windows"]]
+        save_settings(con, {"printer": ""})
+    for bad in ("C:\\pos.db", "..\\x", "LPT1", "COM1;x", "WIN:", "WIN:No Such Printer 123", "WIN:..\\x"):
         try:
             save_settings(con, {"printer": bad})
             raise AssertionError(f"accepted printer {bad!r}")
@@ -1198,7 +1427,7 @@ def selftest():
         assert part["payments"] == [{"method": "Cash", "amount": 50000}, {"method": "UPI", "amount": 28592}]
         rest = get_order(con, oid4)
         assert rest["status"] == "open" and [l["name"] for l in rest["lines"]] == ["Water"]
-        tk = re.sub(rb"\x1b[aE@d].?|\x1d[!V].?", b"", bill_ticket(part, settings(con), 32)).decode()
+        tk = re.sub(ESC_CODES, b"", bill_ticket(part, settings(con), 32)).decode()
         assert "Paid Cash" in tk and "Paid UPI" in tk
         # the rest split equally between 3 people
         w = bill_order(con, {**staff, "order_id": oid4, "payments": [{"method": "UPI", "amount": "21"}] * 3})

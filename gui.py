@@ -9,6 +9,7 @@ from tkinter import messagebox, ttk
 
 import app
 import gdrive
+import printers
 import updater
 
 PORT = app.PORT
@@ -57,6 +58,7 @@ class Window:
 
         self.rows = {}
         specs = [("pos", "POS server", [("Open POS", lambda: self.open_url(f"http://localhost:{PORT}"))]),
+                 ("prn", "Printer", [("Connect", self.printer_connect), ("Test print", self.printer_test)]),
                  ("pub", "Public link", [("Open", lambda: self.open_url(self.rows["pub"]["var"].get())),
                                          ("Copy", lambda: self.copy("pub"))]),
                  ("lan", "Same Wi-Fi", [("Copy", lambda: self.copy("lan"))]),
@@ -286,6 +288,79 @@ class Window:
                 if self.closing:
                     return
                 time.sleep(1)
+
+    # ---------------- Receipt printer ----------------
+    def printer_status(self):
+        """Refresh the Printer row; returns the plugged-in USB ports so the watcher can spot plug/unplug."""
+        target = printers.current()
+        usb = printers.plugged_usb()
+        connected, text = app.printer_status(target)
+        if not target:
+            if usb:
+                self.set("prn", "amber", f"Printer plugged in ({usb[0][0]}) - press Connect to print bills on it")
+            else:
+                self.set("prn", "grey", "No printer - plug the receipt printer's USB cable in and press Connect")
+        elif connected:
+            self.set("prn", "green", text)
+        elif target.startswith(app.WIN_PREFIX) and usb:
+            # the POS points at an unplugged printer but another one is plugged in
+            self.set("prn", "amber", f"{text}. A printer is plugged in on {usb[0][0]} - press Connect to use it")
+        else:
+            self.set("prn", "red", text)
+        return {p for p, _ in usb}
+
+    def printer_watch(self):
+        """Every 3 s: notice the printer being plugged in or pulled out and keep the Printer row up to date."""
+        seen = None
+        while not self.closing:
+            try:
+                now = self.printer_status()
+                if seen is not None:
+                    for p in sorted(now - seen):
+                        log.info("Printer plugged in on %s", p)
+                    for p in sorted(seen - now):
+                        log.warning("Printer unplugged from %s - bills can't print until it is back", p)
+                seen = now
+            except Exception as e:
+                log.error("Printer check failed: %s", e)
+            self.wait(3)
+
+    def printer_connect(self):
+        btn = self.rows["prn"]["btns"][0]
+
+        def run():
+            self.q.put(("call", lambda: btn.state(["disabled"])))
+            self.set("prn", "amber", "Connecting to the printer…")
+            try:
+                name = printers.connect(log)
+                self.printer_status()
+
+                def ask(n=name):
+                    if messagebox.askyesno("Printer connected", f"{n} is connected and is the printer for every bill "
+                                           "and report from any tablet.\n\nPrint a test page now?"):
+                        self.printer_test()
+                self.q.put(("call", ask))
+            except (printers.ConnectError, app.PrinterError) as e:
+                log.error("Printer: %s", e)
+                self.printer_status()
+                self.q.put(("call", lambda m=str(e): messagebox.showwarning("Printer not connected", m)))
+                if printers.protected_print_mode():
+                    os.startfile("ms-settings:printers")
+            except Exception as e:
+                log.exception("Printer connect failed: %s", e)
+                self.printer_status()
+            finally:
+                self.q.put(("call", lambda: btn.state(["!disabled"])))
+        threading.Thread(target=run, daemon=True).start()
+
+    def printer_test(self):
+        def run():
+            try:
+                printers.test_print(log)
+            except (printers.ConnectError, app.PrinterError) as e:
+                log.error("Test print failed: %s", e)
+                self.q.put(("call", lambda m=str(e): messagebox.showwarning("Test print failed", m)))
+        threading.Thread(target=run, daemon=True).start()
 
     # ---------------- Updates from GitHub ----------------
     def toggle_auto(self):
@@ -599,6 +674,7 @@ def main():
         threading.Thread(target=win.watchdog, daemon=True).start()
         threading.Thread(target=win.update_loop, daemon=True).start()
         threading.Thread(target=win.gdrive_loop, daemon=True).start()
+        threading.Thread(target=win.printer_watch, daemon=True).start()
         app.AFTER_CLOSE_DAY = win.after_close_day
     win.gdrive_status()
     root.mainloop()

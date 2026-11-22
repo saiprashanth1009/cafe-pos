@@ -22,6 +22,7 @@ The window then:
 - installs Tailscale if it's missing (approve the Windows prompt), starts it, and opens the sign-in page if needed
 - turns on the public link (Tailscale Funnel). The first time on a new tailnet, approve **Enable Funnel** in the page that opens
 - shows the public link, the Wi-Fi link and the database location with Open/Copy buttons, plus a live log of every order, KOT, bill, cancellation, menu change, wrong PIN and error
+- shows the **Printer** row: which receipt printer the POS prints on and whether it is plugged in (green = ready, amber = plugged in but not connected yet, red = unplugged). It notices the printer being plugged in or pulled out within a few seconds
 - checks everything every 20 seconds and repairs Tailscale or the public link if they drop
 
 Closing the window stops the POS and turns the public link off.
@@ -44,7 +45,9 @@ Back up data: in the app, **Settings → Download backup of all data**, at least
 | Bill & print | Counter | Pick Cash / UPI / Card, set an optional discount %, and print. GST is split into CGST + SGST. There is no round-off: the total is charged to the paisa (e.g. ₹124.96). |
 | Close day | Owner, at closing time | Reports → **Close day & print report**. Bills keep going to the same business day (even after midnight or after restarting the app) until you press this. It prints the daily report and moves billing to the next day. It's blocked while any order is still open. |
 | Printer on a phone | Owner, once per phone | Android only. Install **RawBT** from the Play Store, pair the printer (e.g. EZO, 58 mm) inside RawBT and print its test page. In the POS on that phone: **⚙ (top right) → tick "Print from this phone"**, then **Print a test page**. Paper width is in Settings. Bills and day reports then open RawBT and print. iPhones can't do this. |
-| Printer on the counter PC | Owner, once | Pair the Bluetooth receipt printer (e.g. EZO Chota, 58 mm) with the counter PC in Windows Bluetooth settings. Then **Settings → Receipt printer** = its COM port, **Paper width** = 58 mm, Save, and **Print a test page**. Bills and day reports then print straight away from any tablet. |
+| USB printer on the counter PC | Owner, once | Plug the receipt printer (e.g. EZO, 58 mm) into the counter PC with its USB cable and switch it on. In the CafePOS window press **Printer → Connect**: it finds the printer, installs it in Windows if needed (approve the one admin prompt), makes it the **default printer** and points the POS at it. Press **Test print**. From then on every **Bill & print**, reprint and day report from any tablet prints on it straight away, with no print dialog. Use the USB cable *or* Bluetooth, not both at once: many small printers drop Bluetooth when a cable is plugged in. |
+| Bluetooth printer on the counter PC | Owner, once | Pair the Bluetooth receipt printer with the counter PC in Windows Bluetooth settings (with its USB cable unplugged). Then **Connect** in the CafePOS window, or **Settings → Receipt printer** = its COM port, **Paper width** = 58 mm, Save, and **Print a test page**. |
+| Faint prints | Owner | **Settings → Print darkness = Dark** (the default) prints every line bold and double-struck. Still pale? Thermal printers have no ink: try a fresh paper roll (a fingernail scratch should leave a dark mark), put the shiny side towards the print head, and charge the printer or use a wall charger. |
 | Custom item | Waiters / counter | On the order screen, **+ Custom item**: type a name and price for a one-off dish. It goes to the kitchen, the bill and the receipt, but is never added to the menu. Tick **Ready to serve** for a one-off bottled drink. |
 | Ready-to-serve items | Owner, once per item | **Menu → Edit** an item such as bottled water, Thums Up or Sprite, tick **Ready to serve (no kitchen)** and save. It is then billed as usual but never sent to the kitchen, and shows as *served* on the order. |
 | Discounts | Counter + owner | In the bill box, choose **%** or **₹**. GST is charged on the amount after the discount. On a staff tablet the owner types the owner PIN and a reason. |
@@ -89,6 +92,11 @@ Any 80 mm thermal printer that the tablet can see works.
 - Month and GST-period reports with CSV export for your accountant
 - UPI QR code on the bill, and a packing charge for takeaway/delivery (for now, add it as a menu item)
 - Swiggy/Zomato order entry, and a customer phone book for repeat deliveries
+
+## Printer troubleshooting (Windows)
+- **"Driver unavailable" / Connect says protected print mode is on**: Windows 11's *Windows protected print mode* blocks every receipt-printer driver. Turn it off in **Settings → Bluetooth & devices → Printers & scanners**, then press **Connect** again.
+- **Connected, then disconnected straight away (Bluetooth)**: unplug the USB cable, remove the printer in Bluetooth settings, restart the printer and pair again.
+- **Printer row is red**: the printer is unplugged or switched off. Bills print again as soon as it is back; nothing is queued to print later by surprise.
 
 ## Checks
 `python app.py test` runs the GST maths and a full order → KOT → bill → report flow against a throwaway database.
