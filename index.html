@@ -74,7 +74,14 @@ main>section{padding:12px 16px}
 
 .stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-bottom:12px}
 .stats .card{margin:0}.stats b{display:block;font-size:22px}
-.cols{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:12px}
+.cols>*{min-width:0}.bar.wrap>*{min-width:0}
+.stats b small{display:block;font-size:13px;font-weight:400;margin-top:2px}
+.low td:first-child b{color:var(--acc)}.neg{color:var(--acc);font-weight:600}
+.acts{white-space:nowrap;text-align:right}.acts button{padding:6px 10px;font-size:14px}
+.minus{color:var(--acc)}.plus{color:var(--ok)}
+.recipe td input{width:110px}
+.del td{text-decoration:line-through;opacity:.55}
 .form{display:grid;gap:12px;max-width:560px}
 .wrap{flex-wrap:wrap}.wrap input{min-width:140px}
 
@@ -130,6 +137,8 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
   <button data-view="kitchen" data-perm="kitchen">Kitchen</button>
   <button data-view="dash" data-perm="dashboard">Dashboard</button>
   <button data-view="reports" data-perm="reports">Reports</button>
+  <button data-view="inventory" data-perm="inventory">Inventory</button>
+  <button data-view="expenses" data-perm="expenses">Expenses</button>
   <button data-view="menu" data-perm="menu">Menu</button>
   <button data-view="settings" data-perm="settings">Settings</button>
   <button data-view="profiles" data-perm="profiles">Profiles</button>
@@ -182,6 +191,54 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
   <div id="rep"></div>
 </section>
 
+<section id="inventory" hidden>
+  <div class="bar wrap"><input id="invSearch" placeholder="Search ingredients" autocomplete="off">
+    <div id="invFilter" class="seg" style="grid-template-columns:repeat(3,auto)"><button type="button" data-f="" class="on">All</button>
+      <button type="button" data-f="low">Low / out</button><button type="button" data-f="new">Not counted</button></div>
+    <button id="ingAdd" class="pri" type="button">+ Ingredient</button></div>
+  <p class="mute" style="margin:0 0 10px;font-size:14px">Stock comes off by itself when an item is sent to the kitchen (its recipe × quantity),
+    and goes back if the item is removed or the order cancelled. An ingredient is only tracked once you enter its stock (<b>Count</b> or <b>+ Stock</b>).</p>
+  <div class="card"><table id="invTable"></table></div>
+  <div class="card"><h3 style="margin-top:0">Recipes - what one serving uses</h3>
+    <div class="bar wrap"><select id="recItem"></select><span id="recNone" class="mute" style="font-size:14px"></span></div>
+    <table id="recTable" class="recipe"></table>
+    <div class="bar wrap" style="margin-top:8px"><input id="recIng" list="ingList" placeholder="Add ingredient (type to search)" autocomplete="off">
+      <input id="recQty" type="number" step="any" min="0" inputmode="decimal" placeholder="Qty" style="max-width:110px"><span id="recUnit" class="mute"></span>
+      <button id="recAddRow" type="button">Add</button><button id="recSave" class="pri" type="button">Save recipe</button></div>
+    <datalist id="ingList"></datalist></div>
+  <div class="card"><h3 style="margin-top:0">Stock history - purchases, counts and waste</h3><table id="moveTable"></table></div>
+</section>
+
+<section id="expenses" hidden>
+  <div class="bar wrap"><input id="mday" type="date" style="max-width:220px"><span class="mute" style="font-size:14px">Balances are at the end of this day.</span></div>
+  <div id="moneyTop"></div>
+  <div class="cols">
+    <form id="expForm" class="card">
+      <h3 style="margin-top:0">Add an expense</h3>
+      <label>Amount ₹<input name="amount" type="number" step="0.01" min="0.01" inputmode="decimal" required></label>
+      <label>What for<select name="category"></select></label>
+      <label>Details (optional)<input name="note" maxlength="200" placeholder="e.g. 10 kg onions, Ramesh salary" autocomplete="off"></label>
+      <div>Paid by</div>
+      <div id="expPaid" class="seg" style="grid-template-columns:1fr 1fr;margin:6px 0 12px"><button type="button" data-a="cash" class="on">Cash</button><button type="button" data-a="bank">Bank / UPI</button></div>
+      <button class="pri">Add expense</button>
+    </form>
+    <div class="card">
+      <h3 style="margin-top:0">Balances</h3>
+      <form id="openForm"><p class="mute" style="margin:0 0 6px;font-size:14px">Starting balance: the cash in the drawer and the money in the bank on the day you start (once).</p>
+        <div class="bar wrap"><input name="cash" type="number" step="0.01" min="0" inputmode="decimal" placeholder="Cash ₹">
+          <input name="bank" type="number" step="0.01" min="0" inputmode="decimal" placeholder="Bank ₹"><button>Set</button></div></form>
+      <form id="moveForm"><p class="mute" style="margin:6px 0;font-size:14px">Cash deposited into the bank (or withdrawn from it).</p>
+        <div class="bar wrap"><input name="amount" type="number" step="0.01" min="0.01" inputmode="decimal" placeholder="Amount ₹" required>
+          <select name="to" style="max-width:190px"><option value="bank">Cash → Bank</option><option value="cash">Bank → Cash</option></select><button>Move</button></div></form>
+      <form id="fixForm"><p class="mute" style="margin:6px 0;font-size:14px">Correction after counting the drawer (use − to take off).</p>
+        <div class="bar wrap"><input name="amount" type="number" step="0.01" inputmode="decimal" placeholder="± ₹" required>
+          <select name="account" style="max-width:120px"><option value="cash">Cash</option><option value="bank">Bank</option></select>
+          <input name="note" placeholder="Why" autocomplete="off"><button>Save</button></div></form>
+    </div>
+  </div>
+  <div class="card"><h3 style="margin-top:0">Entries this day</h3><table id="moneyTable"></table></div>
+</section>
+
 <section id="menu" hidden>
   <form id="itemForm" class="card bar wrap">
     <input type="hidden" name="iid">
@@ -214,6 +271,26 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
   </form>
 </section>
 </main>
+
+<dialog id="ingDlg"><form id="ingForm">
+  <h2 id="ingTitle">Ingredient</h2>
+  <input type="hidden" name="ing_id">
+  <label>Name<input name="ing_name" maxlength="80" required autocomplete="off"></label>
+  <label>Counted in<select name="ing_unit"><option value="g">grams (g) - stock can be entered in kg</option>
+    <option value="ml">millilitres (ml) - stock can be entered in L</option><option value="pcs">pieces (pcs)</option></select></label>
+  <label>Warn me when stock is below (optional)<div class="bar"><input name="ing_low" type="number" step="any" min="0" inputmode="decimal">
+    <select name="ing_low_unit" style="max-width:90px"></select></div></label>
+  <div class="row"><button type="button" class="warn" id="ingDel">Delete</button><span style="flex:1"></span><button type="button" data-close>Cancel</button><button class="pri">Save</button></div>
+</form></dialog>
+
+<dialog id="stockDlg"><form id="stockForm">
+  <h2 id="stockTitle"></h2>
+  <p id="stockNow" class="mute" style="margin:0"></p>
+  <label id="stockLbl">Amount<div class="bar"><input name="st_qty" type="number" step="any" min="0" inputmode="decimal" required>
+    <select name="st_unit" style="max-width:90px"></select></div></label>
+  <label>Note (optional)<input name="st_note" maxlength="200" autocomplete="off" placeholder="e.g. supplier, bill no."></label>
+  <div class="row"><button type="button" data-close>Cancel</button><button class="pri">Save</button></div>
+</form></dialog>
 
 <dialog id="whereDlg"><form method="dialog">
   <h2>Where is this order for?</h2>
@@ -459,6 +536,8 @@ function show(v) {
   if (v === 'reports') { $('#rday').value = S.business_day; loadReport() }
   if (v === 'dash') loadDash();
   if (v === 'profiles') loadProfiles();
+  if (v === 'inventory') loadInv();
+  if (v === 'expenses') { $('#mday').value = S.business_day; loadMoney() }
   render();
   scrollTo(0, 0);
 }
@@ -845,8 +924,12 @@ async function loadReport() {
   const aud = await api('/api/audit?day=' + r.day);
   const ACT = {cancel_order: 'Cancelled order', remove_item: 'Removed item', void_bill: 'Voided bill', refund: 'Refund',
                discount: 'Discount', menu_save: 'Menu change', menu_delete: 'Menu delete', settings: 'Settings', close_day: 'Closed day',
-               profile_save: 'Profile saved', profile_delete: 'Profile deleted'};
-  $('#rep').innerHTML = `<div class="stats">${tile('Net sales', money(r.net))}${tile('Bills', r.count)}
+               profile_save: 'Profile saved', profile_delete: 'Profile deleted', expense: 'Expense', money: 'Cash / bank entry',
+               money_delete: 'Deleted money entry'};
+  const bal = r.balances ? `<h3>Balance till the end of this day</h3><div class="stats">${tile('Cash total', money(r.balances.cash))}${tile('Bank total', money(r.balances.bank))}
+      ${tile('Total (cash + bank)', money(r.balances.total))}${tile('Expenses this day', money(r.expenses.cash + r.expenses.bank)
+      + `<br><small class="mute">cash ${money(r.expenses.cash)} · bank ${money(r.expenses.bank)}</small>`)}</div>` : '';
+  $('#rep').innerHTML = bal + `<div class="stats">${tile('Net sales', money(r.net))}${tile('Bills', r.count)}
       ${tile('GST collected', money(s.cgst + s.sgst))}${tile('Discounts given', money(s.discount))}${tile('Cancelled orders', r.cancelled)}
       ${tile('Voided bills', r.voided.count + (r.voided.count ? ' · ' + money(r.voided.total) : ''))}${tile('Refunds', money(r.refunds))}</div>
     <div class="cols">${list('By payment (after refunds)', r.by_payment)}${list('By order type', r.by_type, k => TYPE[k])}</div>
@@ -914,6 +997,176 @@ function printDayReport(r) {  // end-of-day report (Z report)
     + '<hr><div class="c">--- end of report ---</div>';
   browserPrint();
 }
+
+// ---------- inventory ----------
+let INV = {ingredients: [], recipes: {}, moves: []}, invFilter = '', recRows = [];
+const ING = id => INV.ingredients.find(i => i.id === id);
+const UNIT_CHOICES = {g: ['g', 'kg'], ml: ['ml', 'L'], pcs: ['pcs']};
+function fmtQty(q, u) {  // 2500 g -> "2.5 kg"
+  if (q === null || q === undefined) return '<span class="mute">not counted</span>';
+  const big = Math.abs(q) >= 1000 && u !== 'pcs', v = big ? q / 1000 : q;
+  return `${(Math.round(v * 100) / 100).toLocaleString('en-IN')} ${big ? {g: 'kg', ml: 'L'}[u] : u}`;
+}
+async function loadInv() {
+  INV = await api('/api/inventory');
+  if (view !== 'inventory') return;
+  $('#ingList').innerHTML = INV.ingredients.map(i => `<option value="${esc(i.name)}">`).join('');
+  const sel = $('#recItem'), keep = sel.value;
+  sel.innerHTML = '<option value="">Pick a menu item to see / edit its recipe</option>' + items.map(i =>
+    `<option value="${i.id}">${esc(i.category)} · ${esc(i.name)}${INV.recipes[i.id] ? '' : ' (no recipe)'}</option>`).join('');
+  sel.value = keep;
+  const none = items.filter(i => !INV.recipes[i.id] && !i.direct);
+  $('#recNone').textContent = none.length ? `${none.length} items have no recipe yet: ` + none.map(i => i.name).join(', ') : '';
+  renderInv(); renderRecipe();
+  $('#moveTable').innerHTML = INV.moves.length ? '<tr><th>When</th><th>Ingredient</th><th>What</th><th class="r">Change</th><th>Who / note</th></tr>'
+    + INV.moves.map(m => `<tr><td>${m.at.slice(8, 10)}/${m.at.slice(5, 7)} ${m.at.slice(11, 16)}</td><td>${esc(m.name)}</td>
+      <td>${{purchase: 'Bought', count: 'Counted', waste: 'Waste'}[m.kind] || m.kind}</td>
+      <td class="r ${m.qty < 0 ? 'minus' : 'plus'}">${m.qty > 0 ? '+' : ''}${fmtQty(m.qty, m.unit)}</td>
+      <td>${esc(m.who || '')}${m.note ? ' · ' + esc(m.note) : ''}</td></tr>`).join('') : '<tr><td class="mute">Nothing yet.</td></tr>';
+}
+function renderInv() {
+  const q = $('#invSearch').value.trim().toLowerCase();
+  const low = i => i.stock !== null && (i.stock <= 0 || (i.low !== null && i.stock < i.low));
+  const list = INV.ingredients.filter(i => i.name.toLowerCase().includes(q)
+    && (!invFilter || (invFilter === 'low' ? low(i) : i.stock === null)));
+  const nLow = INV.ingredients.filter(low).length;
+  $('#invFilter [data-f="low"]').textContent = `Low / out${nLow ? ' (' + nLow + ')' : ''}`;
+  $('#invTable').innerHTML = '<tr><th>Ingredient</th><th class="r">In stock</th><th class="r">Used today</th><th class="r">Warn below</th><th></th></tr>'
+    + list.map(i => `<tr class="${low(i) ? 'low' : ''}"><td><b>${esc(i.name)}</b></td>
+      <td class="r ${i.stock !== null && i.stock < 0 ? 'neg' : ''}">${fmtQty(i.stock, i.unit)}</td>
+      <td class="r">${i.used_today ? fmtQty(i.used_today, i.unit) : ''}</td><td class="r">${i.low !== null ? fmtQty(i.low, i.unit) : ''}</td>
+      <td class="acts"><button data-st="purchase" data-id="${i.id}">+ Stock</button> <button data-st="count" data-id="${i.id}">Count</button>
+        <button data-st="waste" data-id="${i.id}">Waste</button> <button data-edit="${i.id}">Edit</button></td></tr>`).join('')
+    + (list.length ? '' : '<tr><td class="mute">No ingredients here.</td></tr>');
+}
+$('#invSearch').oninput = renderInv;
+$('#invFilter').onclick = e => { const b = e.target.closest('button'); if (!b) return; invFilter = b.dataset.f;
+  $('#invFilter').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b)); renderInv() };
+let stockFor = null;
+$('#invTable').onclick = e => {
+  const b = e.target.closest('button'); if (!b) return;
+  if (b.dataset.edit) return ingDialog(ING(+b.dataset.edit));
+  const i = ING(+b.dataset.id), f = $('#stockForm'); stockFor = {id: i.id, kind: b.dataset.st};
+  f.reset();
+  $('#stockTitle').textContent = {purchase: 'Add stock (bought)', count: 'Count: how much is there now?', waste: 'Waste / spoiled'}[b.dataset.st] + ' · ' + i.name;
+  $('#stockNow').innerHTML = 'In stock now: ' + fmtQty(i.stock, i.unit);
+  $('#stockLbl').firstChild.textContent = b.dataset.st === 'count' ? 'Total on the shelf' : b.dataset.st === 'waste' ? 'Amount thrown away' : 'Amount bought';
+  f.st_unit.innerHTML = UNIT_CHOICES[i.unit].map(u => `<option value="${u}">${u}</option>`).join('');
+  if (i.unit !== 'pcs') f.st_unit.value = i.unit === 'g' ? 'kg' : 'L';
+  $('#stockDlg').showModal(); f.st_qty.focus();
+};
+$('#stockForm').onsubmit = e => {
+  e.preventDefault(); const f = e.target;
+  once(async () => {
+    await api('/api/inventory/stock', {...stockFor, qty: f.st_qty.value, qty_unit: f.st_unit.value, note: f.st_note.value});
+    $('#stockDlg').close(); await loadInv();
+  });
+};
+function ingDialog(i) {
+  const f = $('#ingForm'); f.reset();
+  $('#ingTitle').textContent = i ? 'Edit ingredient' : 'New ingredient';
+  f.ing_id.value = i?.id || ''; f.ing_name.value = i?.name || ''; f.ing_unit.value = i?.unit || 'g';
+  const units = () => { f.ing_low_unit.innerHTML = UNIT_CHOICES[f.ing_unit.value].map(u => `<option value="${u}">${u}</option>`).join('') };
+  f.ing_unit.onchange = units; units();
+  if (i?.low !== null && i?.low !== undefined) f.ing_low.value = i.low;
+  $('#ingDel').hidden = !i;
+  $('#ingDlg').showModal();
+}
+$('#ingAdd').onclick = () => ingDialog(null);
+$('#ingForm').onsubmit = e => {
+  e.preventDefault(); const f = e.target;
+  once(async () => {
+    await api('/api/inventory/save', {id: f.ing_id.value || null, name: f.ing_name.value, unit: f.ing_unit.value,
+                                      low: f.ing_low.value, low_unit: f.ing_low_unit.value});
+    $('#ingDlg').close(); await loadInv();
+  });
+};
+$('#ingDel').onclick = () => once(async () => {
+  const f = $('#ingForm');
+  if (!confirm(`Delete "${f.ing_name.value}"? It is also taken out of every recipe.`)) return;
+  await api('/api/inventory/delete', {id: +f.ing_id.value}); $('#ingDlg').close(); await loadInv();
+});
+// recipe editor
+function renderRecipe() {
+  const id = +$('#recItem').value;
+  if (!id) { $('#recTable').innerHTML = ''; recRows = []; return }
+  $('#recTable').innerHTML = '<tr><th>Ingredient</th><th>Per serving</th><th></th></tr>' + (recRows.length ? recRows.map((r, n) => {
+    const i = ING(r[0]);
+    return `<tr><td>${esc(i?.name || '?')}</td><td><input type="number" step="any" min="0" value="${r[1]}" data-q="${n}"> ${i?.unit || ''}</td>
+      <td class="r"><button class="x" data-rm="${n}" aria-label="Remove">✕</button></td></tr>`;
+  }).join('') : '<tr><td class="mute" colspan="3">No ingredients yet - add them below.</td></tr>');
+}
+$('#recItem').onchange = () => { recRows = (INV.recipes[+$('#recItem').value] || []).map(r => [...r]); renderRecipe() };
+$('#recTable').oninput = e => { const n = e.target.dataset.q; if (n !== undefined) recRows[+n][1] = parseFloat(e.target.value) || 0 };
+$('#recTable').onclick = e => { const n = e.target.closest('button')?.dataset.rm; if (n !== undefined) { recRows.splice(+n, 1); renderRecipe() } };
+$('#recIng').oninput = () => { const i = INV.ingredients.find(x => x.name === $('#recIng').value); $('#recUnit').textContent = i ? i.unit : '' };
+$('#recAddRow').onclick = () => {
+  if (!+$('#recItem').value) return alert('Pick a menu item first.');
+  const i = INV.ingredients.find(x => x.name === $('#recIng').value), q = parseFloat($('#recQty').value);
+  if (!i) return alert('Pick an ingredient from the list (add it first with "+ Ingredient" if it is new).');
+  if (!(q > 0)) return alert('Enter how much one serving uses, in ' + i.unit + '.');
+  const at = recRows.findIndex(r => r[0] === i.id);
+  at >= 0 ? recRows[at][1] = q : recRows.push([i.id, q]);
+  $('#recIng').value = ''; $('#recQty').value = ''; $('#recUnit').textContent = ''; renderRecipe();
+};
+$('#recSave').onclick = () => once(async () => {
+  const id = +$('#recItem').value; if (!id) return;
+  if (recRows.some(r => !(r[1] > 0))) return alert('Every ingredient needs an amount above 0 (or remove it).');
+  await api('/api/recipes/save', {item_id: id, rows: recRows.map(([ingredient_id, qty]) => ({ingredient_id, qty}))});
+  await loadInv(); alert('Recipe saved.');
+});
+
+// ---------- expenses and balances ----------
+let MONEY = null, expAcc = 'cash';
+$('#mday').onchange = loadMoney;
+async function loadMoney() {
+  MONEY = await api('/api/money?day=' + $('#mday').value);
+  if (view !== 'expenses') return;
+  const b = MONEY.balances, tile = (l, v) => `<div class="card"><small class="mute">${l}</small><b>${v}</b></div>`;
+  $('#moneyTop').innerHTML = (MONEY.opening_set ? '' : '<div class="card" style="background:var(--busy)">Set your <b>starting balance</b> (cash in the drawer and money in the bank) under Balances, so the totals match reality.</div>')
+    + `<div class="stats">${tile('Cash total', money(b.cash))}${tile('Bank total', money(b.bank))}${tile('Total (cash + bank)', money(b.total))}
+      ${tile('Spent this day', money(MONEY.spent.cash + MONEY.spent.bank) + `<br><small class="mute">cash ${money(MONEY.spent.cash)} · bank ${money(MONEY.spent.bank)}</small>`)}</div>`;
+  const sel = $('#expForm').category;
+  if (!sel.options.length) sel.innerHTML = MONEY.categories.map(c => `<option>${esc(c)}</option>`).join('');
+  const KIND = {expense: 'Expense', opening: 'Starting balance', transfer: 'Moved', adjust: 'Correction'};
+  $('#moneyTable').innerHTML = MONEY.rows.length ? '<tr><th>Time</th><th>What</th><th>Cash / bank</th><th class="r">Amount</th><th>By</th><th></th></tr>'
+    + MONEY.rows.map(r => `<tr class="${r.deleted ? 'del' : ''}"><td>${r.at.slice(11, 16)}</td>
+      <td>${KIND[r.kind]}: <b>${esc(r.category || '')}</b>${r.note ? '<br><small class="mute">' + esc(r.note) + '</small>' : ''}</td>
+      <td>${r.account === 'cash' ? 'Cash' : 'Bank'}</td><td class="r ${r.amount < 0 ? 'minus' : 'plus'}">${r.amount < 0 ? '−' : '+'}${money(Math.abs(r.amount))}</td>
+      <td>${esc(r.who || '')}</td><td class="r">${r.deleted ? '<small class="mute">deleted</small>' : `<button class="warn" data-mdel="${r.id}">Delete</button>`}</td></tr>`).join('')
+    : '<tr><td class="mute">No expenses or entries this day.</td></tr>';
+}
+$('#expPaid').onclick = e => { const b = e.target.closest('button'); if (!b) return; expAcc = b.dataset.a;
+  $('#expPaid').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b)) };
+$('#expForm').onsubmit = e => {
+  e.preventDefault(); const f = e.target;
+  once(async () => {
+    await api('/api/money/expense', {amount: f.amount.value, category: f.category.value, note: f.note.value, account: expAcc, day: $('#mday').value});
+    f.amount.value = ''; f.note.value = ''; await loadMoney();
+  });
+};
+$('#openForm').onsubmit = e => {
+  e.preventDefault(); const f = e.target;
+  if (!f.cash.value && !f.bank.value) return;
+  once(async () => {
+    for (const a of ['cash', 'bank']) if (f[a].value !== '') await api('/api/money/add', {kind: 'opening', account: a, amount: f[a].value, day: $('#mday').value});
+    f.reset(); await loadMoney();
+  });
+};
+$('#moveForm').onsubmit = e => {
+  e.preventDefault(); const f = e.target;
+  once(async () => { await api('/api/money/add', {kind: 'transfer', amount: f.amount.value, to: f.to.value, day: $('#mday').value}); f.reset(); await loadMoney() });
+};
+$('#fixForm').onsubmit = e => {
+  e.preventDefault(); const f = e.target;
+  once(async () => { await api('/api/money/add', {kind: 'adjust', amount: f.amount.value, account: f.account.value, note: f.note.value, day: $('#mday').value}); f.reset(); await loadMoney() });
+};
+$('#moneyTable').onclick = e => {
+  const id = e.target.closest('button')?.dataset.mdel; if (!id) return;
+  const r = MONEY.rows.find(x => x.id === +id);
+  if (!confirm(`Delete this entry (${r.category}, ${money(Math.abs(r.amount))})? It stays in the list, crossed out.`)) return;
+  once(async () => { await api('/api/money/delete', {id: +id}); await loadMoney() });
+};
 
 // ---------- menu ----------
 function renderItems() {

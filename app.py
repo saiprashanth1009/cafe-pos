@@ -63,6 +63,23 @@ CREATE TABLE IF NOT EXISTS profiles(id INTEGER PRIMARY KEY, name TEXT NOT NULL, 
     active INTEGER NOT NULL DEFAULT 1, created TEXT NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS profiles_slug ON profiles(slug) WHERE active = 1;
 CREATE UNIQUE INDEX IF NOT EXISTS profiles_pin ON profiles(pin_hash) WHERE active = 1;
+-- inventory: stock in the recipe's unit (g / ml / pcs). stock NULL = not counted yet, so nothing is taken off it
+CREATE TABLE IF NOT EXISTS ingredients(id INTEGER PRIMARY KEY, name TEXT NOT NULL, unit TEXT NOT NULL CHECK(unit IN ('g', 'ml', 'pcs')),
+    stock REAL, low REAL, active INTEGER NOT NULL DEFAULT 1);
+CREATE UNIQUE INDEX IF NOT EXISTS ingredients_name ON ingredients(name) WHERE active = 1;
+-- what one serving of a menu item uses
+CREATE TABLE IF NOT EXISTS recipes(item_id INTEGER NOT NULL REFERENCES items, ingredient_id INTEGER NOT NULL REFERENCES ingredients,
+    qty REAL NOT NULL CHECK(qty > 0), PRIMARY KEY(item_id, ingredient_id));
+-- every stock change: purchase, count, waste, sale (sent to kitchen), back (item removed / order cancelled)
+CREATE TABLE IF NOT EXISTS stock_moves(id INTEGER PRIMARY KEY, at TEXT NOT NULL, day TEXT NOT NULL,
+    ingredient_id INTEGER NOT NULL REFERENCES ingredients, qty REAL NOT NULL, kind TEXT NOT NULL, line_id INTEGER,
+    who TEXT, note TEXT);
+CREATE INDEX IF NOT EXISTS stock_moves_line ON stock_moves(line_id) WHERE line_id IS NOT NULL;
+-- money that isn't a bill: expenses (negative), opening balances, cash moved to the bank. account = cash / bank
+CREATE TABLE IF NOT EXISTS money(id INTEGER PRIMARY KEY, at TEXT NOT NULL, day TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('expense', 'opening', 'transfer', 'adjust')), account TEXT NOT NULL CHECK(account IN ('cash', 'bank')),
+    amount INTEGER NOT NULL, category TEXT, note TEXT, who TEXT, deleted TEXT);
+CREATE INDEX IF NOT EXISTS money_day ON money(day);
 """
 
 
@@ -111,6 +128,34 @@ def init(con):
                 con.executemany("INSERT INTO items(category, name, price) VALUES(?, ?, ?)",
                                 [(r["category"], r["name"], paise(r["price"])) for r in csv.DictReader(f)])
     menu_update_2026_11(con)
+    if not con.execute("SELECT 1 FROM settings WHERE key = 'perms_v8'").fetchone():
+        with con:  # owner profiles made before v8 get inventory + expenses (they can untick them later)
+            for r in con.execute("SELECT id, perms FROM profiles WHERE role = 'owner'").fetchall():
+                con.execute("UPDATE profiles SET perms = ? WHERE id = ?",
+                            (json.dumps(sorted(set(json.loads(r["perms"])) | {"inventory", "expenses"})), r["id"]))
+            con.execute("INSERT INTO settings VALUES('perms_v8', 'done')")
+    load_recipe_book(con)
+
+
+def load_recipe_book(con):
+    """Once per database: the café's recipe book (recipes.csv, 1 serving per dish) becomes the ingredient list and
+    the recipes of the menu items with the same name. Stock starts 'not counted' until someone enters it."""
+    if con.execute("SELECT 1 FROM settings WHERE key = 'recipes_2026_11'").fetchone():
+        return
+    f = RES / "recipes.csv"
+    with con:
+        if f.exists() and not con.execute("SELECT 1 FROM ingredients").fetchone():
+            items = {r["name"]: r["id"] for r in con.execute("SELECT id, name FROM items WHERE active = 1")}
+            ids, n = {}, 0
+            for r in csv.DictReader(open(f, encoding="utf-8")):
+                if r["ingredient"] not in ids:
+                    ids[r["ingredient"]] = con.execute("INSERT INTO ingredients(name, unit) VALUES(?, ?)",
+                                                       (r["ingredient"], r["unit"])).lastrowid
+                if r["item"] in items:
+                    con.execute("INSERT OR REPLACE INTO recipes VALUES(?, ?, ?)", (items[r["item"]], ids[r["ingredient"]], float(r["qty"])))
+                    n += 1
+            log.info("Recipe book loaded: %s ingredients, %s recipe lines", len(ids), n)
+        con.execute("INSERT INTO settings VALUES('recipes_2026_11', 'done')")
 
 
 # One-time move to the menu of 22 Nov 2026 (menu.csv) for cafés still on the old Guns & Roses menu.
@@ -245,6 +290,8 @@ PERMS = {  # what a profile may do - the owner ticks these per profile on the Pr
     "menu": "Edit the menu",
     "settings": "Settings, printer and backup download",
     "close_day": "Close the day",
+    "inventory": "Inventory: stock and recipes",
+    "expenses": "Expenses and cash / bank balances",
     "profiles": "Create and edit profiles (owners only)",
 }
 STAFF_DEFAULT = ["orders", "bill", "kitchen", "remove_item"]
@@ -371,7 +418,10 @@ def report(con, q):
     sums = {k: sum(b[k] for b in bills) for k in ("subtotal", "discount", "cgst", "sgst", "round_off", "total")}
     refunded = sum(r["amount"] for r in refunds)
     voided = [b for b in every if b.get("voided")]
+    spent = {a: -v for a, v in con.execute("SELECT account, SUM(amount) FROM money WHERE kind = 'expense' AND deleted IS NULL "
+                                            "AND day = ? GROUP BY account", (day,))}
     return {"day": day, "open": day == business_day(con), "count": len(bills),
+            "balances": balances(con, day), "expenses": {"cash": spent.get("cash", 0), "bank": spent.get("bank", 0)},
             "sums": sums, "refunds": refunded, "net": sums["total"] - refunded,
             "voided": {"count": len(voided), "total": sum(b["total"] for b in voided)},
             "by_payment": pay, "by_type": typ,
@@ -554,7 +604,33 @@ def send_kot(con, d):
                         [(oid, sid, *l) for l in served])
         log.info("Order #%s: served without kitchen: %s", oid, ", ".join(f"{q}x {n}" for i, n, p, q in served))
         kid = kid or sid
+    use_stock(con, d, [k for k in (kid, sid if served else None) if k])
     return {"id": kid, "order_id": oid}
+
+
+def use_stock(con, d, kot_ids):
+    """Take each line's recipe off the stock (only ingredients that have been counted)."""
+    who, day, at = (d.get("_who") or {}).get("name"), business_day(con), now()
+    for l in con.execute(f"SELECT id, item_id, qty FROM lines WHERE item_id IS NOT NULL AND kot_id IN ({','.join('?' * len(kot_ids))})",
+                         kot_ids).fetchall():
+        for r in con.execute("SELECT r.ingredient_id, r.qty FROM recipes r JOIN ingredients i ON i.id = r.ingredient_id "
+                             "WHERE r.item_id = ? AND i.active = 1 AND i.stock IS NOT NULL", (l["item_id"],)).fetchall():
+            q = r["qty"] * l["qty"]
+            con.execute("UPDATE ingredients SET stock = stock - ? WHERE id = ?", (q, r["ingredient_id"]))
+            con.execute("INSERT INTO stock_moves(at, day, ingredient_id, qty, kind, line_id, who) VALUES(?, ?, ?, ?, 'sale', ?, ?)",
+                        (at, day, r["ingredient_id"], -q, l["id"], who))
+
+
+def give_back_stock(con, d, line_ids, why):
+    """An item removed or an order cancelled: what was taken off for those lines goes back on the shelf."""
+    who, day, at = (d.get("_who") or {}).get("name"), business_day(con), now()
+    for lid in line_ids:
+        for m in con.execute("SELECT ingredient_id, SUM(qty) AS q FROM stock_moves WHERE line_id = ? GROUP BY ingredient_id",
+                             (lid,)).fetchall():
+            if m["q"] < 0:
+                con.execute("UPDATE ingredients SET stock = COALESCE(stock, 0) - ? WHERE id = ?", (m["q"], m["ingredient_id"]))
+                con.execute("INSERT INTO stock_moves(at, day, ingredient_id, qty, kind, line_id, who, note) "
+                            "VALUES(?, ?, ?, ?, 'back', ?, ?, ?)", (at, day, m["ingredient_id"], -m["q"], lid, who, why))
 
 
 def remove_line(con, d):
@@ -564,6 +640,7 @@ def remove_line(con, d):
                     (int(d["line_id"]),)).fetchone()
     if not l:
         raise ValueError("item not found or order already billed")
+    give_back_stock(con, d, [l["id"]], "item removed")
     con.execute("DELETE FROM lines WHERE id = ?", (l["id"],))
     audit(con, d, "remove_item", l["order_id"], l["price"] * l["qty"], reason, f"{l['qty']} x {l['name']}")
     return {"ok": True}
@@ -575,6 +652,7 @@ def cancel_order(con, d):
     if not o or not con.execute("UPDATE orders SET status = 'cancelled', day = ? WHERE id = ? AND status = 'open'",
                                 (business_day(con), o["id"])).rowcount:
         raise ValueError("order is not open")
+    give_back_stock(con, d, [l["id"] for l in o["lines"]], "order cancelled")
     audit(con, d, "cancel_order", o["id"], o["amount"], reason,
           ", ".join(f"{l['qty']} x {l['name']}" for l in o["lines"]) or "no items")
     return {"ok": True}
@@ -592,6 +670,184 @@ def kot_undo(con, d):
                        (int(d["id"]),)).rowcount:
         raise ValueError("ticket not found or already back in the kitchen")
     log.info("KOT %s back to cooking (by %s)", d["id"], (d.get("_who") or {}).get("name", "?"))
+    return {"ok": True}
+
+
+# ---- inventory ----
+UNITS = {"g": 1, "kg": 1000, "ml": 1, "l": 1000, "pcs": 1}  # what can be typed -> the ingredient's own unit
+BASE = {"g": "g", "kg": "g", "ml": "ml", "l": "ml", "pcs": "pcs"}
+
+
+def inventory(con, q):
+    ing = [dict(r) for r in con.execute("SELECT id, name, unit, stock, low FROM ingredients WHERE active = 1 ORDER BY name")]
+    used = {r[0]: -r[1] for r in con.execute("SELECT ingredient_id, SUM(qty) FROM stock_moves WHERE day = ? AND kind IN "
+                                             "('sale', 'back') GROUP BY ingredient_id", (business_day(con),))}
+    for i in ing:
+        i["used_today"] = used.get(i["id"], 0)
+    recipes = {}
+    for r in con.execute("SELECT r.item_id, r.ingredient_id, r.qty FROM recipes r JOIN ingredients i ON i.id = r.ingredient_id "
+                         "WHERE i.active = 1 ORDER BY r.qty DESC"):
+        recipes.setdefault(r["item_id"], []).append([r["ingredient_id"], r["qty"]])
+    moves = [dict(r) for r in con.execute(
+        "SELECT m.at, m.qty, m.kind, m.who, m.note, i.name, i.unit FROM stock_moves m JOIN ingredients i ON i.id = m.ingredient_id "
+        "WHERE m.kind NOT IN ('sale', 'back') ORDER BY m.id DESC LIMIT 100")]
+    return {"ingredients": ing, "recipes": recipes, "moves": moves}
+
+
+def in_unit(qty, typed, unit):
+    """'2' kg for an ingredient kept in g -> 2000. Only units of the same kind are accepted."""
+    typed = (typed or unit).lower()
+    if BASE.get(typed) != unit:
+        raise ValueError(f"enter this in {unit}" + {"g": " or kg", "ml": " or L"}.get(unit, ""))
+    return float(Decimal(str(qty))) * UNITS[typed]
+
+
+def save_ingredient(con, d):
+    name, unit = str(d.get("name") or "").strip()[:80], d.get("unit")
+    if not name or unit not in ("g", "ml", "pcs"):
+        raise ValueError("ingredient needs a name and a unit (g, ml or pcs)")
+    low = in_unit(d["low"], d.get("low_unit"), unit) if str(d.get("low") or "").strip() else None
+    if d.get("id"):
+        r = con.execute("SELECT unit FROM ingredients WHERE id = ? AND active = 1", (int(d["id"]),)).fetchone()
+        if not r:
+            raise ValueError("ingredient not found")
+        if r["unit"] != unit and con.execute("SELECT 1 FROM stock_moves WHERE ingredient_id = ?", (int(d["id"]),)).fetchone():
+            raise ValueError("the unit can't change once stock has moved - add a new ingredient instead")
+        con.execute("UPDATE ingredients SET name = ?, unit = ?, low = ? WHERE id = ?", (name, unit, low, int(d["id"])))
+    else:
+        con.execute("INSERT INTO ingredients(name, unit, low) VALUES(?, ?, ?)", (name, unit, low))
+    return {"ok": True}
+
+
+def delete_ingredient(con, d):
+    con.execute("UPDATE ingredients SET active = 0 WHERE id = ?", (int(d["id"]),))
+    con.execute("DELETE FROM recipes WHERE ingredient_id = ?", (int(d["id"]),))
+    return {"ok": True}
+
+
+def stock_change(con, d):
+    """purchase: + qty, waste: - qty, count: the shelf has exactly qty (starts counting a new ingredient)."""
+    kind = d.get("kind")
+    if kind not in ("purchase", "waste", "count"):
+        raise ValueError("bad stock change")
+    r = con.execute("SELECT id, name, unit, stock FROM ingredients WHERE id = ? AND active = 1", (int(d["id"]),)).fetchone()
+    if not r:
+        raise ValueError("ingredient not found")
+    q = in_unit(d["qty"], d.get("qty_unit"), r["unit"])
+    if q < 0 or (kind != "count" and q == 0):
+        raise ValueError("enter an amount above 0")
+    old = r["stock"] or 0
+    new = old + q if kind == "purchase" else old - q if kind == "waste" else q
+    con.execute("UPDATE ingredients SET stock = ? WHERE id = ?", (new, r["id"]))
+    con.execute("INSERT INTO stock_moves(at, day, ingredient_id, qty, kind, who, note) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (now(), business_day(con), r["id"], new - old, kind, (d.get("_who") or {}).get("name"),
+                 str(d.get("note") or "").strip()[:200] or None))
+    log.info("Stock %s: %s %s%s -> %s%s", kind, r["name"], f"{q:g}", r["unit"], f"{new:g}", r["unit"])
+    return {"ok": True, "stock": new}
+
+
+def save_recipe(con, d):
+    item = int(d["item_id"])
+    if not con.execute("SELECT 1 FROM items WHERE id = ?", (item,)).fetchone():
+        raise ValueError("menu item not found")
+    rows = []
+    for x in d.get("rows") or []:
+        q = float(Decimal(str(x["qty"])))
+        if q <= 0:
+            raise ValueError("each ingredient needs an amount above 0")
+        if not con.execute("SELECT 1 FROM ingredients WHERE id = ? AND active = 1", (int(x["ingredient_id"]),)).fetchone():
+            raise ValueError("ingredient not found")
+        rows.append((item, int(x["ingredient_id"]), q))
+    con.execute("DELETE FROM recipes WHERE item_id = ?", (item,))
+    con.executemany("INSERT OR REPLACE INTO recipes VALUES(?, ?, ?)", rows)
+    return {"ok": True}
+
+
+# ---- expenses and cash / bank balances ----
+EXPENSE_CATS = ("Groceries", "Vegetables", "Milk & dairy", "Meat", "Packaging", "Gas", "Electricity", "Rent", "Salaries",
+                "Repairs", "Owner withdrawal", "Other")
+
+
+def balances(con, day):
+    """Cash and bank till the end of `day`: opening balances + payments taken - refunds given +/- expenses and transfers."""
+    paid = {m: a for m, a in con.execute(
+        "SELECT p.method, SUM(p.amount) FROM payments p JOIN orders o ON o.id = p.order_id WHERE o.status = 'billed' "
+        "AND o.voided IS NULL AND o.day <= ? GROUP BY p.method", (day,))}
+    back = {m: a for m, a in con.execute("SELECT method, SUM(amount) FROM refunds WHERE day <= ? GROUP BY method", (day,))}
+    other = {a: v for a, v in con.execute("SELECT account, SUM(amount) FROM money WHERE deleted IS NULL AND day <= ? "
+                                          "GROUP BY account", (day,))}
+    cash = paid.get("Cash", 0) - back.get("Cash", 0) + other.get("cash", 0)
+    bank = sum(paid.get(m, 0) - back.get(m, 0) for m in ("UPI", "Card")) + other.get("bank", 0)
+    return {"cash": cash, "bank": bank, "total": cash + bank}
+
+
+def money_list(con, q):
+    day = q.get("day", [business_day(con)])[0]
+    rows = [dict(r) for r in con.execute("SELECT * FROM money WHERE day = ? ORDER BY deleted IS NOT NULL, id DESC", (day,))]
+    live = [r for r in rows if not r["deleted"] and r["kind"] == "expense"]
+    return {"day": day, "rows": rows, "categories": EXPENSE_CATS, "balances": balances(con, day),
+            "opening_set": bool(con.execute("SELECT 1 FROM money WHERE kind = 'opening' AND deleted IS NULL").fetchone()),
+            "spent": {"cash": -sum(r["amount"] for r in live if r["account"] == "cash"),
+                      "bank": -sum(r["amount"] for r in live if r["account"] == "bank")}}
+
+
+def money_day(con, d):
+    day = str(d.get("day") or business_day(con))
+    date.fromisoformat(day)  # ValueError if not a date
+    if day > business_day(con) and day > date.today().isoformat():
+        raise ValueError("that date is in the future")
+    return day
+
+
+def add_expense(con, d):
+    amount, account = paise(d.get("amount") or 0), d.get("account")
+    if account not in ("cash", "bank"):
+        raise ValueError("choose how it was paid: cash or bank")
+    if amount <= 0:
+        raise ValueError("enter the amount paid")
+    cat = str(d.get("category") or "Other").strip()[:40] or "Other"
+    note, day = str(d.get("note") or "").strip()[:200], money_day(con, d)
+    con.execute("INSERT INTO money(at, day, kind, account, amount, category, note, who) VALUES(?, ?, 'expense', ?, ?, ?, ?, ?)",
+                (now(), day, account, -amount, cat, note or None, (d.get("_who") or {}).get("name")))
+    audit(con, d, "expense", amount=amount, detail=f"{cat}{' - ' + note if note else ''}, paid by {account}", day=day)
+    return {"ok": True}
+
+
+def add_money(con, d):
+    """Opening balance (what was in the drawer / bank on day one), cash deposited into the bank, or a correction."""
+    kind, amount, day = d.get("kind"), paise(d.get("amount") or 0), money_day(con, d)
+    who, note = (d.get("_who") or {}).get("name"), str(d.get("note") or "").strip()[:200] or None
+    if kind == "transfer":
+        if amount <= 0:
+            raise ValueError("enter the amount moved")
+        src, dst = ("cash", "bank") if d.get("to") != "cash" else ("bank", "cash")
+        for acc, amt in ((src, -amount), (dst, amount)):
+            con.execute("INSERT INTO money(at, day, kind, account, amount, category, note, who) VALUES(?, ?, 'transfer', ?, ?, ?, ?, ?)",
+                        (now(), day, acc, amt, f"{src.title()} to {dst}", note, who))
+        audit(con, d, "money", amount=amount, detail=f"moved {src} to {dst}", day=day)
+    elif kind in ("opening", "adjust"):
+        account = d.get("account")
+        if account not in ("cash", "bank") or (kind == "opening" and amount < 0) or (kind == "adjust" and not amount):
+            raise ValueError("bad amount or account")
+        if kind == "opening":
+            con.execute("UPDATE money SET deleted = ? WHERE kind = 'opening' AND account = ? AND deleted IS NULL", (now(), account))
+        con.execute("INSERT INTO money(at, day, kind, account, amount, category, note, who) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    (now(), day, kind, account, amount, "Opening balance" if kind == "opening" else "Correction", note, who))
+        audit(con, d, "money", amount=amount, detail=f"{'opening balance' if kind == 'opening' else 'correction'}, {account}", day=day)
+    else:
+        raise ValueError("bad entry")
+    return {"ok": True}
+
+
+def delete_money(con, d):
+    r = con.execute("SELECT * FROM money WHERE id = ? AND deleted IS NULL", (int(d["id"]),)).fetchone()
+    if not r:
+        raise ValueError("entry not found")
+    if r["kind"] == "transfer":  # both halves of a transfer go together
+        con.execute("UPDATE money SET deleted = ? WHERE kind = 'transfer' AND at = ? AND deleted IS NULL", (now(), r["at"]))
+    else:
+        con.execute("UPDATE money SET deleted = ? WHERE id = ?", (now(), r["id"]))
+    audit(con, d, "money_delete", amount=abs(r["amount"]), detail=f"{r['category']}, {r['account']}", day=r["day"])
     return {"ok": True}
 
 
@@ -1226,12 +1482,16 @@ def test_ticket(con):
 
 
 GET = {"/api/state": state, "/api/kitchen": kitchen, "/api/report": report, "/api/backup": backup,
-       "/api/printers": printer_ports, "/api/audit": audit_log, "/api/dashboard": dashboard, "/api/profiles": list_profiles}
+       "/api/printers": printer_ports, "/api/audit": audit_log, "/api/dashboard": dashboard, "/api/profiles": list_profiles,
+       "/api/inventory": inventory, "/api/money": money_list}
 POST = {"/api/items": save_item, "/api/items/delete": delete_item, "/api/settings": save_settings,
         "/api/orders/new": new_order, "/api/orders/kot": send_kot, "/api/orders/remove_line": remove_line,
         "/api/orders/cancel": cancel_order, "/api/orders/bill": bill_order, "/api/kots/ready": kot_ready,
         "/api/day/close": close_day, "/api/print": print_job, "/api/bills/void": void_bill, "/api/bills/refund": refund_bill,
-        "/api/kots/undo": kot_undo, "/api/profiles/save": save_profile, "/api/profiles/delete": delete_profile}
+        "/api/kots/undo": kot_undo, "/api/profiles/save": save_profile, "/api/profiles/delete": delete_profile,
+        "/api/inventory/save": save_ingredient, "/api/inventory/delete": delete_ingredient, "/api/inventory/stock": stock_change,
+        "/api/recipes/save": save_recipe, "/api/money/expense": add_expense, "/api/money/add": add_money,
+        "/api/money/delete": delete_money}
 # what each request needs (discounts and the day report are checked inside bill_order / print_job)
 ROUTE_PERMS = {"/api/kitchen": "kitchen", "/api/report": "reports", "/api/audit": "reports", "/api/backup": "settings",
                "/api/printers": "settings", "/api/dashboard": "dashboard", "/api/items": "menu", "/api/items/delete": "menu",
@@ -1239,7 +1499,10 @@ ROUTE_PERMS = {"/api/kitchen": "kitchen", "/api/report": "reports", "/api/audit"
                "/api/orders/remove_line": "remove_item", "/api/orders/cancel": "cancel", "/api/orders/bill": "bill",
                "/api/kots/ready": "kitchen", "/api/kots/undo": "kitchen", "/api/day/close": "close_day",
                "/api/bills/void": "void_refund", "/api/bills/refund": "void_refund", "/api/profiles": "profiles",
-               "/api/profiles/save": "profiles", "/api/profiles/delete": "profiles"}
+               "/api/profiles/save": "profiles", "/api/profiles/delete": "profiles",
+               "/api/inventory": "inventory", "/api/inventory/save": "inventory", "/api/inventory/delete": "inventory",
+               "/api/inventory/stock": "inventory", "/api/recipes/save": "inventory", "/api/money": "expenses",
+               "/api/money/expense": "expenses", "/api/money/add": "expenses", "/api/money/delete": "expenses"}
 
 
 # ponytail: one global lockout, so guessing a 6-digit PIN online takes months; an attacker can also keep
@@ -1629,6 +1892,72 @@ def selftest():
         st = state(con, me)
         assert st["me"]["name"] == "Sai" and st["me"]["slug"] == "sai_owner" and st["profiles_on"]
         assert "pin_key" not in st["settings"]
+    # ---- inventory: recipe book loaded; stock comes off when sent to the kitchen, back when removed/cancelled ----
+    with con:
+        inv = inventory(con, {})
+        assert len(inv["ingredients"]) == 138 and all(i["stock"] is None for i in inv["ingredients"])
+        burger = con.execute("SELECT id FROM items WHERE name = 'Classic Veg Burger'").fetchone()[0]
+        ing = {i["name"]: i["id"] for i in inv["ingredients"]}
+        assert dict(inv["recipes"][burger])[ing["Burger buns (sesame)"]] == 1
+        bun, onion = ing["Burger buns (sesame)"], ing["Onion"]
+        stock_change(con, {"id": bun, "kind": "count", "qty": "50", "qty_unit": "pcs"})
+        stock_change(con, {"id": onion, "kind": "purchase", "qty": "2", "qty_unit": "kg"})   # kg typed, kept in g
+        st_ = lambda i: con.execute("SELECT stock FROM ingredients WHERE id = ?", (i,)).fetchone()[0]
+        assert (st_(bun), st_(onion)) == (50, 2000)
+        try:
+            stock_change(con, {"id": bun, "kind": "purchase", "qty": "1", "qty_unit": "kg"})
+            raise AssertionError("kg accepted for pcs")
+        except ValueError:
+            pass
+        ki = send_kot(con, {"order": {"type": "takeaway"}, "lines": [{"id": burger, "qty": 3}]})
+        assert (st_(bun), st_(onion)) == (47, 2000 - 45)
+        tomato = ing["Tomato"]
+        assert st_(tomato) is None  # never counted -> not tracked, nothing taken off
+        line = get_order(con, ki["order_id"])["lines"][0]
+        remove_line(con, {"line_id": line["id"], "reason": "wrong item"})
+        assert (st_(bun), st_(onion)) == (50, 2000)
+        ki = send_kot(con, {"order": {"type": "takeaway"}, "lines": [{"id": burger, "qty": 2}]})
+        cancel_order(con, {"order_id": ki["order_id"], "reason": "left"})
+        assert st_(bun) == 50
+        combo = con.execute("SELECT id FROM items WHERE name = 'Burger Buddy (Veg)'").fetchone()[0]
+        send_kot(con, {"order": {"type": "takeaway"}, "lines": [{"id": combo, "qty": 1}]})
+        assert st_(bun) == 49  # a combo uses its dishes' ingredients
+        stock_change(con, {"id": bun, "kind": "waste", "qty": "4", "note": "stale"})
+        assert st_(bun) == 45 and inventory(con, {})["moves"][0]["kind"] == "waste"
+        save_recipe(con, {"item_id": burger, "rows": [{"ingredient_id": bun, "qty": 2}]})
+        assert inventory(con, {})["recipes"][burger] == [[bun, 2]]
+    # ---- expenses and cash / bank balances ----
+    with con:
+        day = business_day(con)
+        b0 = balances(con, day)
+        add_money(con, {"kind": "opening", "account": "cash", "amount": "1000"})
+        add_money(con, {"kind": "opening", "account": "bank", "amount": "5000"})
+        add_expense(con, {"amount": "250.50", "account": "cash", "category": "Vegetables", "note": "onions"})
+        add_expense(con, {"amount": "1200", "account": "bank", "category": "Gas"})
+        add_money(con, {"kind": "transfer", "to": "bank", "amount": "300"})
+        b1 = balances(con, day)
+        assert b1["cash"] - b0["cash"] == 100000 - 25050 - 30000 and b1["bank"] - b0["bank"] == 500000 - 120000 + 30000
+        assert b1["total"] == b1["cash"] + b1["bank"]
+        ml = money_list(con, {"day": [day]})
+        assert ml["spent"] == {"cash": 25050, "bank": 120000} and ml["opening_set"]
+        assert report(con, {"day": [day]})["expenses"] == {"cash": 25050, "bank": 120000}
+        gas = next(r for r in ml["rows"] if r["category"] == "Gas")
+        delete_money(con, {"id": gas["id"]})
+        assert balances(con, day)["bank"] == b1["bank"] + 120000
+        tr = next(r for r in ml["rows"] if r["kind"] == "transfer")
+        delete_money(con, {"id": tr["id"]})  # both halves go
+        assert balances(con, day)["cash"] == b1["cash"] + 30000
+        add_money(con, {"kind": "opening", "account": "cash", "amount": "2000"})  # replaces the old opening
+        assert balances(con, day)["cash"] == b1["cash"] + 30000 + 100000
+        try:
+            add_expense(con, {"amount": "10", "account": "wallet"})
+            raise AssertionError("bad account")
+        except ValueError:
+            pass
+        paid_cash = con.execute("SELECT COALESCE(SUM(p.amount), 0) FROM payments p JOIN orders o ON o.id = p.order_id "
+                                "WHERE o.status = 'billed' AND o.voided IS NULL AND p.method = 'Cash'").fetchone()[0]
+        refunds_cash = con.execute("SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE method = 'Cash'").fetchone()[0]
+        assert b0["cash"] == paid_cash - refunds_cash  # before any opening/expense: cash = cash taken - cash refunded
     snap = sqlite3.connect(":memory:")
     if hasattr(snap, "deserialize"):  # Python 3.11+
         snap.deserialize(backup(con, {}))
