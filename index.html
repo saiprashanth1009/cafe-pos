@@ -175,7 +175,7 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
   </aside>
 </section>
 
-<section id="kitchen" hidden><div class="bar"><span style="flex:1"></span><button id="prevBtn">Previous orders</button></div>
+<section id="kitchen" hidden><div id="soundHint" class="card net" hidden>🔔 Tap anywhere on the screen once to turn the order sound on (the browser needs one tap after it opens).</div><div class="bar"><span style="flex:1"></span><button id="prevBtn">Previous orders</button></div>
   <div id="kots" class="kots"></div><div id="recent" hidden></div></section>
 
 <section id="dash" hidden>
@@ -360,6 +360,9 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
   <label><input type="checkbox" name="phonePrint" style="width:auto"> Print from <b>this phone</b> on its Bluetooth printer
     (Android: install the free RawBT app and pair the printer in RawBT). Only this phone changes.</label>
   <button type="button" id="tabletTest">Print a test page</button>
+  <label><input type="checkbox" name="kitchenSound" style="width:auto"> 🔔 <b>Ring on this tablet</b> when a new order or note reaches the kitchen.
+    Tick it only on the kitchen tablet - other tablets stay silent.</label>
+  <button type="button" id="soundTest">Play the sound</button>
   <div class="row"><span></span><button class="pri">Done</button></div>
 </form></dialog>
 
@@ -496,7 +499,7 @@ function renderWho() {
 const firstView = () => $('nav [data-perm]:not([hidden])')?.dataset.view || 'floor';
 $('#whoBtn').onclick = () => {
   const f = $('#tabletForm');
-  f.device.value = store('device'); f.phonePrint.checked = phonePrint();
+  f.device.value = store('device'); f.phonePrint.checked = phonePrint(); f.kitchenSound.checked = kitchenSound();
   $('#tabletWho').innerHTML = `Signed in as <b>${esc(ME.name)}</b> (${esc(ME.role)}).`
     + (ME.slug ? `<br><small class="mute">Your link: ${esc(profLink(ME.slug))}</small>` : '')
     + (!PROFILES_ON && can('profiles') ? '<br><small class="mute">Tip: create a profile for each person in <b>Profiles</b>.</small>' : '');
@@ -505,6 +508,36 @@ $('#whoBtn').onclick = () => {
 $('#tabletForm').device.onchange = e => store('device', e.target.value.trim());
 $('#tabletForm').phonePrint.onchange = e => store('phonePrint', e.target.checked ? '1' : '');
 $('#tabletTest').onclick = () => $('#testPrint').click();
+$('#tabletForm').kitchenSound.onchange = e => { store('kitchenSound', e.target.checked ? '1' : ''); if (e.target.checked) chime(); soundHint() };
+$('#soundTest').onclick = () => chime();
+
+// ---------- kitchen sound: only on tablets where "Ring on this tablet" is ticked (saved on the tablet itself) ----------
+const kitchenSound = () => store('kitchenSound') === '1';
+let audio = null, seenKots = null;
+function unlockAudio() {  // browsers only allow sound after a tap on the page
+  try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); if (audio.state === 'suspended') audio.resume() } catch {}
+  setTimeout(soundHint, 200);
+}
+document.addEventListener('pointerdown', unlockAudio, true);
+function soundHint() { $('#soundHint').hidden = !(kitchenSound() && can('kitchen') && (!audio || audio.state !== 'running')) }
+function chime() {  // "ding-dong" twice, loud enough for a kitchen
+  unlockAudio(); if (!audio) return;
+  const t0 = audio.currentTime + 0.05;
+  [[0, 988], [0.28, 784], [0.75, 988], [1.03, 784]].forEach(([dt, f]) => {
+    const o = audio.createOscillator(), g = audio.createGain(), t = t0 + dt;
+    o.type = 'triangle'; o.frequency.value = f;
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.9, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.45);
+    o.connect(g).connect(audio.destination); o.start(t); o.stop(t + 0.5);
+  });
+  if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+}
+function ringIfNew(kots) {  // the first look only remembers what is already there; after that each new ticket rings once
+  const ids = kots.map(k => k.id);
+  if (!seenKots) { seenKots = new Set(ids); return }
+  const fresh = ids.filter(id => !seenKots.has(id));
+  ids.forEach(id => seenKots.add(id));
+  if (fresh.length && kitchenSound()) chime();
+}
 $('#logoutBtn').onclick = () => {  // forget this link's PIN; the next person signs in on the main page
   if (queue.length && !confirm('KOTs are still waiting to be sent from this tablet. Sign out anyway?')) return;
   store(PKEY, ''); location.href = '/';
@@ -880,7 +913,9 @@ function printReceipt(b) {
 // ---------- kitchen ----------
 async function loadKitchen() {
   const {kots, recent} = await api('/api/kitchen');
+  ringIfNew(kots);
   if (view !== 'kitchen') return;
+  soundHint();
   const title = k => k.type === 'dine_in' ? 'Table ' + k.table_no : TYPE[k.type] + ' #' + k.order_id;
   const prev = !$('#recent').hidden;
   $('#prevBtn').textContent = prev ? 'Hide previous orders' : 'Previous orders';
@@ -1369,7 +1404,10 @@ async function loadDash() {
 // ---------- live refresh: other tablets' orders and new KOTs show up within a few seconds ----------
 setInterval(() => {
   if (queue.length) flushQueue().then(() => view === 'floor' && load().catch(() => {}));
-  if (document.hidden || working || document.querySelector('dialog[open]')) return;
+  const busy = document.hidden || working || document.querySelector('dialog[open]');
+  // a ringing tablet keeps listening for new KOTs even on another screen or with a box open
+  if (kitchenSound() && can('kitchen') && (busy || view !== 'kitchen')) api('/api/kitchen').then(d => ringIfNew(d.kots)).catch(() => {});
+  if (busy) return;
   if (view === 'kitchen') loadKitchen().catch(() => {});
   if (view === 'floor') load().catch(() => {});
 }, 5000);
