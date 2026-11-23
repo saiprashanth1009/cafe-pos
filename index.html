@@ -153,7 +153,7 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
     <div id="grid" class="items"></div>
   </div>
   <aside class="card ticket">
-    <h2 id="otitle"></h2>
+    <div class="row"><h2 id="otitle" style="margin:0"></h2><button id="whereBtn" type="button">Change</button></div>
     <div id="ticket"></div>
     <input id="note" placeholder="Note for kitchen (e.g. Maggi dry, less spicy)" autocomplete="off" style="margin-top:10px">
     <div class="row big" style="margin-top:12px"><span>Subtotal</span><span id="osub"></span></div>
@@ -215,12 +215,20 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
 </section>
 </main>
 
+<dialog id="whereDlg"><form method="dialog">
+  <h2>Where is this order for?</h2>
+  <p class="mute" style="margin:0">Pick a table, or Takeaway / Delivery. A busy table gets these items added to its open order.</p>
+  <div id="whereTables" class="tiles" style="margin:12px 0"></div>
+  <div class="tiles"><button type="button" class="tile add" data-new="takeaway">Takeaway</button><button type="button" class="tile add" data-new="delivery">Delivery</button></div>
+  <div class="row" style="margin-top:12px"><button type="button" data-cancel>Cancel</button></div>
+</form></dialog>
+
 <dialog id="custDlg"><form id="custForm">
   <h2 id="custTitle"></h2>
   <label>Customer name<input name="customer" autocomplete="off"></label>
   <label>Phone<input name="phone" type="tel" inputmode="tel" autocomplete="off"></label>
   <label id="addrWrap">Delivery address<textarea name="address" rows="3"></textarea></label>
-  <div class="row"><button type="button" data-close>Cancel</button><button class="pri">Start order</button></div>
+  <div class="row"><button type="button" data-close>Cancel</button><button class="pri" id="custStart">Start order</button></div>
 </form></dialog>
 
 <dialog id="billDlg"><form id="billForm">
@@ -473,7 +481,7 @@ function renderFloor() {
     const o = orders.find(o => o.type === 'dine_in' && o.table_no === t);
     h += `<button class="tile ${o ? 'busy' : ''}" data-table="${t}">T${t}<small>${tileInfo(o)}</small></button>`;
   }
-  $('#tables').innerHTML = h;
+  $('#tables').innerHTML = `<button class="tile add" data-new="any" style="grid-column:1/-1;min-height:64px">+ New order<small>take the order first, pick the table when sending</small></button>` + h;
   // business day only moves on "Close day", so remind staff if yesterday was never closed
   const late = S.business_day < today(), noOwner = can('profiles') && !PROFILES_ON;
   $('#dayBanner').hidden = !(late || noOwner);
@@ -490,28 +498,82 @@ $('#floor').onclick = e => {
     const t = +b.dataset.table;
     return openOrder(orders.find(o => o.type === 'dine_in' && o.table_no === t) || {type: 'dine_in', table_no: t, lines: [], amount: 0});
   }
-  if (b.dataset.new) {
-    const f = $('#custForm'), dl = b.dataset.new === 'delivery';
-    f.reset(); f.dataset.type = b.dataset.new;
-    $('#custTitle').textContent = 'New ' + TYPE[b.dataset.new];
-    $('#addrWrap').hidden = !dl; f.phone.required = f.address.required = dl;
-    $('#custDlg').showModal();
-  }
+  if (b.dataset.new === 'any') return openOrder({type: null, lines: [], amount: 0});
+  if (b.dataset.new) custDialog(b.dataset.new, false);
 };
+function custDialog(type, pick) {  // pick: the order already has items, this only sets where it goes
+  const f = $('#custForm'), dl = type === 'delivery';
+  f.reset(); f.dataset.type = type; f.dataset.pick = pick ? '1' : '';
+  $('#custTitle').textContent = (pick ? '' : 'New ') + TYPE[type];
+  $('#custStart').textContent = pick ? 'OK' : 'Start order';
+  $('#addrWrap').hidden = !dl; f.phone.required = f.address.required = dl;
+  $('#custDlg').showModal();
+}
 $('#custForm').onsubmit = e => {
   e.preventDefault(); const f = e.target;
+  if (f.dataset.pick) {  // order taken first: now it's a takeaway/delivery
+    Object.assign(cur, {type: f.dataset.type, table_no: null, customer: f.customer.value, phone: f.phone.value, address: f.address.value});
+    f.dataset.pick = ''; $('#custDlg').close(); donePicking(true); return;
+  }
   $('#custDlg').close();
   openOrder({type: f.dataset.type, customer: f.customer.value, phone: f.phone.value, address: f.address.value, lines: [], amount: 0});
 };
-document.querySelectorAll('[data-close]').forEach(b => b.onclick = () => b.closest('dialog').close());
+document.querySelectorAll('[data-close]').forEach(b => b.onclick = () => {
+  b.closest('dialog').close();
+  if (b.closest('#custDlg') && $('#custForm').dataset.pick) { $('#custForm').dataset.pick = ''; donePicking(!!cur?.type) }
+});
+
+// Order first, place later: "+ New order" starts a draft with no table; the table / takeaway / delivery
+// is picked when it goes to the kitchen or to billing (or with "Change" any time before that).
+let picking = null;
+function pickWhere() {
+  if (picking) donePicking(false);  // never leave an earlier pick hanging
+  return new Promise(res => {
+    picking = res;
+    let h = '';
+    for (let t = 1; t <= +S.tables; t++) {
+      const o = orders.find(o => o.type === 'dine_in' && o.table_no === t);
+      h += `<button type="button" class="tile ${o ? 'busy' : ''}" data-table="${t}">T${t}<small>${o ? 'add to ' + money(o.amount) : 'free'}</small></button>`;
+    }
+    $('#whereTables').innerHTML = h;
+    $('#whereDlg').showModal();
+  });
+}
+function donePicking(ok) { const r = picking; picking = null; if (r) { renderOrder(); r(ok) } }
+$('#whereDlg').onclick = e => {
+  const b = e.target.closest('button[type=button]'); if (!b) return;
+  if (b.hasAttribute('data-cancel')) { $('#whereDlg').close(); donePicking(!!cur?.type) }
+  else if (b.dataset.table) {
+    Object.assign(cur, {type: 'dine_in', table_no: +b.dataset.table, customer: '', phone: '', address: ''});
+    $('#whereDlg').close(); donePicking(true);
+  } else if (b.dataset.new) { $('#whereDlg').dataset.cust = '1'; $('#whereDlg').close(); custDialog(b.dataset.new, true) }
+};
+$('#whereDlg').addEventListener('close', () => {
+  if ($('#whereDlg').dataset.cust) { $('#whereDlg').dataset.cust = ''; return }  // went on to the customer box
+  donePicking(!!cur?.type);
+});
+// Esc closes a dialog without our buttons: finish the pick so the order screen never stays locked
+['#whereDlg', '#custDlg'].forEach(id => $(id).addEventListener('keydown', e => {
+  if (e.key === 'Escape') { e.preventDefault(); $(id).close(); if (id === '#custDlg') $('#custForm').dataset.pick = ''; donePicking(!!cur?.type) }
+}));
+$('#custDlg').addEventListener('close', () => { if ($('#custForm').dataset.pick) { $('#custForm').dataset.pick = ''; donePicking(!!cur?.type) } });
+$('#whereBtn').onclick = async () => {
+  const was = {...cur};
+  if (!await pickWhere()) Object.assign(cur, was), renderOrder();  // cancelled: keep what it was
+};
+async function needWhere() {  // before the first send: make sure the order has a place
+  return cur.type ? true : await pickWhere();
+}
 
 // ---------- order ----------
 // an order without id is a draft: it's created on the server with its first KOT, so tapping a table by mistake leaves nothing behind
 function openOrder(o) { cur = o; cart.clear(); cat = ''; $('#search').value = ''; $('#note').value = ''; show('order') }
-function orderTitle(o) { return o.type === 'dine_in' ? `Table ${o.table_no}` : `${TYPE[o.type]}${o.id ? ' #' + o.id : ''}${o.customer ? ' · ' + o.customer : ''}` }
+function orderTitle(o) { return !o.type ? 'New order (no table yet)' : o.type === 'dine_in' ? `Table ${o.table_no}` : `${TYPE[o.type]}${o.id ? ' #' + o.id : ''}${o.customer ? ' · ' + o.customer : ''}` }
 function renderOrder() {
   if (!cur) return show('floor');
   $('#otitle').textContent = orderTitle(cur);
+  $('#whereBtn').hidden = !!cur.id;  // a draft can still change table; a sent order stays where it is
+  $('#whereBtn').textContent = cur.type ? 'Change' : 'Pick table';
   const cats = [...new Set(items.map(i => i.category))];
   $('#cats').innerHTML = ['', ...cats].map(c => `<button class="${c === cat ? 'on' : ''}" data-cat="${esc(c)}">${esc(c || 'All')}</button>`).join('');
   renderGrid(); renderTicket();
@@ -596,7 +658,7 @@ async function sendKot() {
   await load().catch(() => {});
   return sent;
 }
-$('#sendKot').onclick = () => once(async () => { await sendKot(); cur = null; show('floor') });
+$('#sendKot').onclick = () => once(async () => { if (!await needWhere()) return; await sendKot(); cur = null; show('floor') });
 $('#cancelOrder').onclick = () => once(async () => {
   if (!await approve(`Cancel the whole order for ${orderTitle(cur)} (${money(cur.amount)})?\nIt shows in reports and the audit log as cancelled.`,
                      '/api/orders/cancel', {order_id: cur.id}, 'cancel', {reason: true})) return;
@@ -615,6 +677,7 @@ function calc(lines, disc) {  // preview only - mirrors totals() in app.py, whic
 let pays = [], picked = new Set(), billTotal = 0;
 $('#billBtn').onclick = () => once(async () => {
   // anything still in the cart goes to the kitchen first, so the bill matches what was ordered
+  if (!await needWhere()) return;
   if (!await sendKot() || !online) return alert('No connection to the POS - the items are queued for the kitchen, but billing needs the connection. Try again in a moment.');
   if (!cur) return;
   discMode = '%'; $('#bdisc').value = 0; $('#billTitle').textContent = 'Bill · ' + orderTitle(cur);
