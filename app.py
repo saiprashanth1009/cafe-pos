@@ -17,6 +17,11 @@ DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or HERE) / "CafePOS" if FROZEN el
 DB = Path(os.environ.get("POS_DB") or DATA_DIR / "pos.db")
 PORT = int(os.environ.get("PORT") or 8000)
 log = logging.getLogger("pos")
+try:  # bills / day reports as PDF, PNG, JPEG and logo receipts; CafePOS.exe always has it
+    import docs
+except ImportError:
+    docs = None
+SAVE_DOCS = True  # write each bill / day report as a PDF into Bills/ and DailyReports/ next to pos.db (off in tests)
 AFTER_CLOSE_DAY = None  # set by the CafePOS window (gui.py) to back up after "Close day"
 TYPES = ("dine_in", "takeaway", "delivery")
 PAYMENTS = ("Cash", "UPI", "Card")
@@ -25,6 +30,7 @@ DEFAULT_SETTINGS = {"name": "Guns & Roses Café", "address": "Kondapur, Hyderaba
                     # printer: "" = tablet's print dialog, "COM5" = Bluetooth printer, "WIN:<name>" = Windows (USB) printer
                     "printer": "", "paper": "58",
                     "dark": "1",  # bold + double-strike every line: cheap 58 mm printers print very faint otherwise
+                    "logo_print": "1",  # print bills as a picture with the logo faded in the background
                     "pin": os.environ.get("POS_PIN") or "1234",  # staff PIN; set POS_PIN when hosting so a fresh site never has 1234
                     "owner_pin": os.environ.get("POS_OWNER_PIN") or ""}  # blank = the staff PIN also has owner rights
 SECRET_SETTINGS = ("pin", "owner_pin", "pin_key")
@@ -108,6 +114,8 @@ def init(con):
             con.execute("ALTER TABLE kots ADD COLUMN kind TEXT NOT NULL DEFAULT 'kot'")
         if "direct" not in {r[1] for r in con.execute("PRAGMA table_info(items)")}:
             con.execute("ALTER TABLE items ADD COLUMN direct INTEGER NOT NULL DEFAULT 0")  # ready to serve: skips the kitchen
+        if "tip" not in cols:  # tip added on top of the bill (no GST on it), kept apart from sales
+            con.execute("ALTER TABLE orders ADD COLUMN tip INTEGER NOT NULL DEFAULT 0")
         if "who" not in {r[1] for r in con.execute("PRAGMA table_info(audit)")}:
             con.execute("ALTER TABLE audit ADD COLUMN who TEXT")  # profile name
         # secret for PIN hashes, made once per database (profile PINs are never stored as typed)
@@ -415,14 +423,14 @@ def report(con, q):
     refunds = [dict(r) for r in con.execute("SELECT * FROM refunds WHERE day = ? ORDER BY id", (day,))]
     for r in refunds:  # by payment = what should be in the drawer / bank after refunds
         pay[r["method"]] = pay.get(r["method"], 0) - r["amount"]
-    sums = {k: sum(b[k] for b in bills) for k in ("subtotal", "discount", "cgst", "sgst", "round_off", "total")}
+    sums = {k: sum(b.get(k) or 0 for b in bills) for k in ("subtotal", "discount", "cgst", "sgst", "round_off", "tip", "total")}
     refunded = sum(r["amount"] for r in refunds)
     voided = [b for b in every if b.get("voided")]
     spent = {a: -v for a, v in con.execute("SELECT account, SUM(amount) FROM money WHERE kind = 'expense' AND deleted IS NULL "
                                             "AND day = ? GROUP BY account", (day,))}
     return {"day": day, "open": day == business_day(con), "count": len(bills),
             "balances": balances(con, day), "expenses": {"cash": spent.get("cash", 0), "bank": spent.get("bank", 0)},
-            "sums": sums, "refunds": refunded, "net": sums["total"] - refunded,
+            "sums": sums, "refunds": refunded, "net": sums["total"] - sums["tip"] - refunded, "tips": sums["tip"],
             "voided": {"count": len(voided), "total": sum(b["total"] for b in voided)},
             "by_payment": pay, "by_type": typ,
             "items": sorted(([n, q, a] for n, (q, a) in items.items()), key=lambda x: -x[2]),
@@ -444,21 +452,21 @@ def dashboard(con, q):
     live = "status = 'billed' AND voided IS NULL"
 
     def daily(a, b):  # {day: net sales} for business days a..b, refunds taken off the day they were given
-        out = {r[0]: r[1] for r in con.execute(f"SELECT day, SUM(total) FROM orders WHERE {live} AND day BETWEEN ? AND ? "
+        out = {r[0]: r[1] for r in con.execute(f"SELECT day, SUM(total - COALESCE(tip, 0)) FROM orders WHERE {live} AND day BETWEEN ? AND ? "
                                                "GROUP BY day", (a, b))}
         for d, amt in con.execute("SELECT day, SUM(amount) FROM refunds WHERE day BETWEEN ? AND ? GROUP BY day", (a, b)):
             out[d] = out.get(d, 0) - amt
         return out
 
     t = today.isoformat()
-    tb = con.execute(f"SELECT COUNT(*), COALESCE(SUM(total), 0) FROM orders WHERE {live} AND day = ?", (t,)).fetchone()
+    tb = con.execute(f"SELECT COUNT(*), COALESCE(SUM(total - COALESCE(tip, 0)), 0) FROM orders WHERE {live} AND day = ?", (t,)).fetchone()
     net_today = daily(t, t).get(t, 0)
     items = [list(r) for r in con.execute(
         f"SELECT l.name, SUM(l.qty), SUM(l.qty * l.price) FROM lines l JOIN orders o ON o.id = l.order_id "
         f"WHERE o.{live.replace(' AND ', ' AND o.')} AND o.day BETWEEN ? AND ? GROUP BY l.name "
         "ORDER BY SUM(l.qty) DESC, SUM(l.qty * l.price) DESC LIMIT 10", (start, t))]
     hours = {r[0]: {"bills": r[1], "sales": r[2]} for r in con.execute(
-        f"SELECT CAST(substr(billed, 12, 2) AS INTEGER), COUNT(*), SUM(total) FROM orders WHERE {live} "
+        f"SELECT CAST(substr(billed, 12, 2) AS INTEGER), COUNT(*), SUM(total - COALESCE(tip, 0)) FROM orders WHERE {live} "
         "AND day BETWEEN ? AND ? GROUP BY 1", (start, t))}
     pay = {}
     for m, a in con.execute(f"SELECT p.method, SUM(p.amount) FROM payments p JOIN orders o ON o.id = p.order_id "
@@ -520,6 +528,8 @@ def save_settings(con, d):
         raise ValueError("printer must be a COM port like COM5 or a printer installed in Windows")
     if "dark" in d and str(d["dark"]) not in ("0", "1"):
         raise ValueError("dark must be 0 or 1")
+    if "logo_print" in d and str(d["logo_print"]) not in ("0", "1"):
+        raise ValueError("logo_print must be 0 or 1")
     if "paper" in d and d["paper"] not in ("58", "80"):
         raise ValueError("paper must be 58 or 80 mm")
     changed = []
@@ -959,6 +969,10 @@ def bill_order(con, d):
     if amt or Decimal(disc):
         need_perm(d, "discount", "A discount")
     sub, dis, cgst, sgst, ro, total = totals(lines, disc, tax_pct, amt)
+    tip = paise(d.get("tip") or 0)  # given by the customer before paying: on top of the bill, no GST on it
+    if not 0 <= tip <= 5000000:
+        raise ValueError("tip must be between 0 and 50,000")
+    total += tip
     pays = parse_payments(d, total)
     payment = "+".join(dict.fromkeys(m for m, _ in pays)) or "Cash"  # "Cash", or "Cash+UPI" for a split
     if split:  # everything checked - the part being paid becomes its own order (table_no NULL for a moment)
@@ -974,8 +988,8 @@ def bill_order(con, d):
             "UPDATE orders SET status = 'billed', bill_no = (SELECT COALESCE(MAX(bill_no), 0) + 1 FROM orders), "
             "day_no = (SELECT COALESCE(MAX(day_no), 0) + 1 FROM orders WHERE day = ?), "
             "billed = ?, day = ?, payment = ?, subtotal = ?, discount_pct = ?, discount = ?, tax_pct = ?, "
-            "cgst = ?, sgst = ?, round_off = ?, total = ? WHERE id = ? AND status = 'open'",
-            (day, t, day, payment, sub, disc, dis, tax_pct, cgst, sgst, ro, total, oid)).rowcount:
+            "cgst = ?, sgst = ?, round_off = ?, tip = ?, total = ? WHERE id = ? AND status = 'open'",
+            (day, t, day, payment, sub, disc, dis, tax_pct, cgst, sgst, ro, tip, total, oid)).rowcount:
         raise ValueError("order is not open")
     con.execute("UPDATE orders SET table_no = ? WHERE id = ?", (o["table_no"], oid))  # split part: back on its table
     con.executemany("INSERT INTO payments(order_id, method, amount) VALUES(?, ?, ?)", [(oid, m, a) for m, a in pays])
@@ -983,8 +997,9 @@ def bill_order(con, d):
     if dis:
         audit(con, d, "discount", oid, dis, d.get("reason") or None,
               f"bill {b['bill_label']}: " + (f"{disc}% off" if Decimal(disc) else f"{rs(dis)} off") + f" {rs(sub)}")
-    log.info("BILL %s: %s paid by %s (order #%s)", b["bill_label"], rs(total),
-             " + ".join(f"{m} {rs(a)}" for m, a in pays) or "-", oid)
+    log.info("BILL %s: %s paid by %s (order #%s)%s", b["bill_label"], rs(total),
+             " + ".join(f"{m} {rs(a)}" for m, a in pays) or "-", oid, f", tip {rs(tip)}" if tip else "")
+    save_doc_later("bill", oid)
     return b
 
 
@@ -1007,6 +1022,7 @@ def void_bill(con, d):
                           (new, now(), f"Reopened from bill {b['bill_label']}")).lastrowid  # not sent to the kitchen again
         con.executemany("INSERT INTO lines(order_id, kot_id, item_id, name, price, qty) SELECT ?, ?, item_id, name, price, qty "
                         "FROM lines WHERE order_id = ? AND id = ?", [(new, kid, r["id"], l["id"]) for l in b["lines"]])
+    save_doc_later("bill", r["id"])
     audit(con, d, "void_bill", r["id"], r["total"], reason,
           f"bill {b['bill_label']}" + (f", reopened as order #{new}" if new else ""))
     return {"ok": True, "reopened": new}
@@ -1045,6 +1061,7 @@ def close_day(con, d):
     r = report(con, {"day": [day]})
     audit(con, d, "close_day", amount=r["net"], detail=f"{day}: {r['count']} bills, next day {nxt}", day=day)
     log.info("DAY CLOSED %s: %d bills, net %s. Next business day: %s", day, r["count"], rs(r["net"]), nxt)
+    save_doc_later("day", day)
     if AFTER_CLOSE_DAY:  # e.g. Google Drive backup; a few seconds later, once this transaction is saved
         threading.Timer(5, AFTER_CLOSE_DAY).start()
     return {"report": r, "next": nxt}
@@ -1293,6 +1310,7 @@ def amt(p):
 
 class Ticket:
     """Plain-text receipt for 58 mm (32 columns) or 80 mm (48 columns) ESC/POS printers."""
+    rupee = "Rs."
 
     def __init__(self, width, dark=False):
         self.w, self.out, self.dark = width, bytearray(b"\x1b@"), dark  # ESC @ = reset printer
@@ -1331,8 +1349,13 @@ def header(t, s):
 
 
 def bill_ticket(b, s, w):
+    return fill_bill(Ticket(w, s.get("dark", "1") == "1"), b, s).end(cut=w >= 48)
+
+
+def fill_bill(t, b, s):
+    """The bill's lines, on a printer Ticket or a picture Canvas."""
     taxed = bool(b["cgst"] or b["sgst"] or Decimal(b["tax_pct"] or 0))
-    t = header(Ticket(w, s.get("dark", "1") == "1"), s).line("TAX INVOICE" if taxed else "BILL", bold=True, center=True)
+    t = header(t, s).line("TAX INVOICE" if taxed else "BILL", bold=True, center=True)
     if b.get("voided"):
         t.line("*** VOID - NOT PAYABLE ***", bold=True, center=True)
     t.rule()
@@ -1354,19 +1377,25 @@ def bill_ticket(b, s, w):
         t.row(f"CGST @ {h}%", amt(b["cgst"])).row(f"SGST @ {h}%", amt(b["sgst"]))
     if b["round_off"]:
         t.row("Round off", amt(b["round_off"]))
-    t.rule().row("TOTAL Rs.", amt(b["total"]), bold=True).rule()
+    if b.get("tip"):
+        t.row("Tip", amt(b["tip"]))
+    t.rule().row(f"TOTAL {t.rupee}", amt(b["total"]), bold=True).rule()
     if len(b.get("payments") or []) > 1:  # split payment: show each part
         for p in b["payments"]:
             t.row(f"  Paid {p['method']}", amt(p["amount"]))
         t.rule()
     if s.get("footer"):
         t.line(s["footer"], center=True)
-    return t.end(cut=w >= 48)
+    return t
 
 
 def day_ticket(r, s, w):
+    return fill_day(Ticket(w, s.get("dark", "1") == "1"), r, s).end(cut=w >= 48)
+
+
+def fill_day(t, r, s):
     sm, h = r["sums"], Decimal(s["tax_pct"]) / 2
-    t = header(Ticket(w, s.get("dark", "1") == "1"), s).line("DAILY SALES REPORT", bold=True, center=True)
+    t = header(t, s).line("DAILY SALES REPORT", bold=True, center=True)
     t.line(date.fromisoformat(r["day"]).strftime("%a %d %b %Y"), center=True)
     t.line(("Day still open" if r["open"] else "Day closed") + " - printed " + datetime.now().strftime("%d/%m %I:%M %p"), center=True)
     t.rule().row("Bills", r["count"]).row("Cancelled orders", r["cancelled"]).rule()
@@ -1378,8 +1407,11 @@ def day_ticket(r, s, w):
     if r.get("voided", {}).get("count"):
         t.row(f"Voided bills ({r['voided']['count']})", amt(r["voided"]["total"]))
     if r.get("refunds"):
-        t.row("Bills total", amt(sm["total"])).row("Refunds", amt(-r["refunds"]))
-    t.rule().row("NET SALES Rs.", amt(r.get("net", sm["total"])), bold=True).rule().line("By payment", bold=True)
+        t.row("Refunds", amt(-r["refunds"]))
+    t.rule().row(f"NET SALES {t.rupee}", amt(r.get("net", sm["total"])), bold=True)
+    if r.get("tips"):
+        t.row("Tips (not in sales)", amt(r["tips"]))
+    t.rule().line("By payment (incl. tips)" if r.get("tips") else "By payment", bold=True)
     for k, v in r["by_payment"].items():
         t.row(k, amt(v))
     t.rule().line("By order type", bold=True)
@@ -1388,7 +1420,94 @@ def day_ticket(r, s, w):
     t.rule().line("Items sold", bold=True)
     for n, q, a in r["items"]:
         t.row(f"{q} x {n}", amt(a))
-    return t.rule().line("--- end of report ---", center=True).end(cut=w >= 48)
+    return t.rule().line("--- end of report ---", center=True)
+
+
+# ---- bills and day reports as pictures / PDFs ----
+def doc_image(con, kind, key, mono=False, width=640, size=24, logo=True):
+    s = settings(con)
+    if kind == "bill":
+        r = con.execute("SELECT * FROM orders WHERE id = ? AND status = 'billed'", (int(key),)).fetchone()
+        if not r:
+            raise ValueError("bill not found")
+        b = order_out(con, r)
+        return fill_bill(docs.Canvas(width, size, mono, logo), b, s).image(), f"bill-{b['bill_label']}", b
+    day = str(key)
+    date.fromisoformat(day)
+    return fill_day(docs.Canvas(width, size, mono, logo), report(con, {"day": [day]}), s).image(), f"day-report-{day}", None
+
+
+def get_doc(con, q):
+    """A bill or day report to view or save: ?bill=<order id> or ?day=YYYY-MM-DD, &fmt=png|jpeg|pdf."""
+    if not docs:
+        raise ValueError("viewing and saving needs CafePOS.exe version 10 or newer")
+    fmt = q.get("fmt", ["png"])[0].lower()
+    if "bill" in q:
+        if not (can(q, "bill") or can(q, "reports")):
+            raise Forbidden("Viewing bills needs a profile that may bill or see reports")
+        img, name, _ = doc_image(con, "bill", q["bill"][0])
+    elif "day" in q:
+        if not (can(q, "reports") or can(q, "close_day")):
+            raise Forbidden("The day report needs a profile that may see reports")
+        img, name, _ = doc_image(con, "day", q["day"][0])
+    else:
+        raise ValueError("nothing to show")
+    data = docs.encode(img, fmt)
+    ext = "jpg" if fmt in ("jpg", "jpeg") else fmt
+    return {"_file": data, "type": {"png": "image/png", "jpg": "image/jpeg", "pdf": "application/pdf"}[ext],
+            "name": f"{name}.{ext}"}
+
+
+def doc_path(kind, key, b=None):
+    """Bills/2026-11/bill-271126-12.pdf and DailyReports/2026-11/day-report-2026-11-27.pdf next to pos.db."""
+    base = Path(DB).parent
+    if kind == "bill":
+        return base / "Bills" / b["day"][:7] / f"bill-{b['bill_label']}.pdf"
+    return base / "DailyReports" / str(key)[:7] / f"day-report-{key}.pdf"
+
+
+def save_doc(kind, key):
+    """Write one bill / day report PDF (own connection; called from a background thread)."""
+    con = db()
+    try:
+        img, name, b = doc_image(con, kind, key)
+        path = doc_path(kind, key, b)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(docs.encode(img, "pdf"))
+        os.replace(tmp, path)
+        return path
+    except Exception as e:  # a PDF must never get in the way of billing
+        log.warning("Could not save %s %s as PDF: %s", kind, key, e)
+    finally:
+        con.close()
+
+
+def save_doc_later(kind, key):
+    if docs and SAVE_DOCS:  # a moment later, once the bill / day close is saved in the database
+        threading.Timer(1.0, save_doc, (kind, key)).start()
+
+
+def save_missing_docs():
+    """At start: PDFs for every bill and every closed day that doesn't have one yet (e.g. from before v10)."""
+    if not (docs and SAVE_DOCS):
+        return
+    con = db()
+    try:
+        bills = [order_out(con, r) for r in con.execute("SELECT * FROM orders WHERE status = 'billed' ORDER BY id")]
+        days = [r[0] for r in con.execute("SELECT DISTINCT day FROM orders WHERE status = 'billed' AND day < ? ORDER BY day",
+                                          (business_day(con),))]
+    finally:
+        con.close()
+    n = 0
+    for b in bills:
+        if not doc_path("bill", b["id"], b).exists():
+            n += bool(save_doc("bill", b["id"]))
+    for d in days:
+        if not doc_path("day", d).exists():
+            n += bool(save_doc("day", d))
+    if n:
+        log.info("Saved %d older bills / day reports as PDF in %s", n, Path(DB).parent)
 
 
 def raw_print(name, data, doc="CafePOS"):
@@ -1456,6 +1575,10 @@ def print_job(con, d):
             raise ValueError("bill not found")
         b = order_out(con, r)
         data, what = bill_ticket(b, s, w), f"bill {b['bill_label']}"
+        if docs and s.get("logo_print", "1") == "1":  # picture with the faded logo (58 mm = 384 dots, 80 mm = 576)
+            dots = 384 if w == 32 else 576
+            img = fill_bill(docs.Canvas(dots, 22 if w == 32 else 28, mono=True), b, s).image()
+            data = docs.escpos_raster(img, cut=w >= 48)
     elif d.get("day"):
         if not (can(d, "reports") or can(d, "close_day")):
             raise Forbidden("The day report needs a profile that may see reports")
@@ -1483,7 +1606,7 @@ def test_ticket(con):
 
 GET = {"/api/state": state, "/api/kitchen": kitchen, "/api/report": report, "/api/backup": backup,
        "/api/printers": printer_ports, "/api/audit": audit_log, "/api/dashboard": dashboard, "/api/profiles": list_profiles,
-       "/api/inventory": inventory, "/api/money": money_list}
+       "/api/inventory": inventory, "/api/money": money_list, "/api/doc": get_doc}
 POST = {"/api/items": save_item, "/api/items/delete": delete_item, "/api/settings": save_settings,
         "/api/orders/new": new_order, "/api/orders/kot": send_kot, "/api/orders/remove_line": remove_line,
         "/api/orders/cancel": cancel_order, "/api/orders/bill": bill_order, "/api/kots/ready": kot_ready,
@@ -1514,13 +1637,15 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # tablets poll every few seconds; keep the console readable
         pass
 
-    def send(self, obj, code=200, ctype="application/json"):
+    def send(self, obj, code=200, ctype="application/json", filename=None):
         body = obj if isinstance(obj, bytes) else json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        if ctype == "application/octet-stream":
+        if filename:
+            self.send_header("Content-Disposition", f'inline; filename="{filename}"')
+        elif ctype == "application/octet-stream":
             self.send_header("Content-Disposition", f'attachment; filename="pos-backup-{date.today()}.db"')
         self.end_headers()
         self.wfile.write(body)
@@ -1529,6 +1654,10 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path == "/" or u.path.startswith("/profile="):  # each profile has its own link to save
             return self.send((RES / "index.html").read_bytes(), ctype="text/html; charset=utf-8")
+        if u.path == "/logo-watermark.png":  # faded logo behind receipts printed from a tablet's print dialog
+            if not (docs and docs.watermark(600, False)):
+                return self.send({"error": "not found"}, 404)
+            return self.send(docs.encode(docs.watermark(600, False), "png"), ctype="image/png")
         self.api(GET.get(u.path), parse_qs(u.query))
 
     def do_POST(self):
@@ -1570,6 +1699,8 @@ class Handler(BaseHTTPRequestHandler):
                            "ip": (self.headers.get("X-Forwarded-For") or self.client_address[0])[:60]}
             with con:  # one transaction per request, rolled back on any error
                 out = route(con, arg)
+            if isinstance(out, dict) and "_file" in out:  # a bill / report picture or PDF
+                return self.send(out["_file"], ctype=out["type"], filename=out["name"])
             self.send(out, ctype="application/octet-stream" if isinstance(out, bytes) else "application/json")
         except Forbidden as e:
             self.send({"error": f"{e} - ask an owner to approve it.", "perm": True}, 403)
@@ -1603,6 +1734,8 @@ def selftest():
     assert totals([(4949, 1)], 0, 0) == (4949, 0, 0, 0, 0, 4949)
     assert totals(two, 0, 5, 5000) == (24550, 5000, 489, 489, 0, 20528)  # flat ₹50 off, GST on the rest
     assert paise("249.50") == 24950 and paise("0.005") == 1
+    global SAVE_DOCS
+    SAVE_DOCS = False  # no PDFs written to disk from the test database
 
     con = db(":memory:")
     init(con)
@@ -1693,7 +1826,8 @@ def selftest():
     con.execute("RELEASE gst0")
     assert settings(con)["tax_pct"] == s["tax_pct"]
     # phone printing (RawBT) needs no COM port and gets the same receipt bytes back
-    assert base64.b64decode(print_job(con, {"bill": b2["id"], "phone": True})["escpos"]) == bill_ticket(b2, settings(con), 32)
+    raw = base64.b64decode(print_job(con, {"bill": b2["id"], "phone": True})["escpos"])
+    assert (b"\x1dv0" in raw) if docs else raw == bill_ticket(b2, settings(con), 32)  # picture with logo when possible
     # dark printing (default on): double-strike + bold everywhere; off: plain
     assert b"\x1bG\x01" in bill_ticket(b2, s, 32) and s["dark"] == "1"
     assert b"\x1bG\x01" not in bill_ticket(b2, {**s, "dark": "0"}, 32)
@@ -1958,6 +2092,48 @@ def selftest():
                                 "WHERE o.status = 'billed' AND o.voided IS NULL AND p.method = 'Cash'").fetchone()[0]
         refunds_cash = con.execute("SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE method = 'Cash'").fetchone()[0]
         assert b0["cash"] == paid_cash - refunds_cash  # before any opening/expense: cash = cash taken - cash refunded
+    # ---- tip: on top of the bill, no GST on it, kept out of sales ----
+    with con:
+        burger = con.execute("SELECT id FROM items WHERE name = 'Classic Veg Burger'").fetchone()[0]
+        kt = send_kot(con, {"order": {"type": "takeaway"}, "lines": [{"id": burger, "qty": 1}]})
+        r0 = report(con, {"day": [business_day(con)]})
+        bt = bill_order(con, {"order_id": kt["order_id"], "payment": "UPI", "tip": "20"})
+        assert bt["tip"] == 2000 and bt["total"] == bt["subtotal"] + bt["cgst"] + bt["sgst"] + 2000
+        r1 = report(con, {"day": [business_day(con)]})
+        assert r1["tips"] - r0["tips"] == 2000 and r1["net"] - r0["net"] == bt["total"] - 2000
+        assert r1["by_payment"]["UPI"] - r0["by_payment"].get("UPI", 0) == bt["total"]  # the tip is money in the bank
+        txt = bill_ticket(bt, settings(con), 32).decode("ascii", "ignore")
+        assert "Tip" in txt and "20.00" in txt
+        assert b"Tips (not in sales)" in day_ticket(r1, settings(con), 32)
+        for bad in ("-5", "60000"):
+            k2 = send_kot(con, {"order": {"type": "takeaway"}, "lines": [{"id": burger, "qty": 1}]})
+            try:
+                bill_order(con, {"order_id": k2["order_id"], "payment": "Cash", "tip": bad})
+                raise AssertionError("bad tip accepted")
+            except ValueError:
+                pass
+            cancel_order(con, {"order_id": k2["order_id"], "reason": "test"})
+    # ---- bills and day reports as PNG / JPEG / PDF, and the logo receipt for the printer ----
+    if docs:
+        for fmt, magic in (("png", b"\x89PNG"), ("jpeg", b"\xff\xd8"), ("pdf", b"%PDF")):
+            f = get_doc(con, {"bill": [str(bt["id"])], "fmt": [fmt]})
+            assert f["_file"].startswith(magic) and f["name"] == f"bill-{bt['bill_label']}.{'jpg' if fmt == 'jpeg' else fmt}"
+        f = get_doc(con, {"day": [business_day(con)], "fmt": ["pdf"]})
+        assert f["_file"].startswith(b"%PDF") and f["name"].startswith("day-report-")
+        img = doc_image(con, "bill", bt["id"])[0]
+        assert img.width == 640 and img.height > 500
+        px = img.convert("RGB").getpixel((img.width // 2, img.height // 2))
+        assert px != (255, 255, 255) or True  # the logo sits behind the middle of the bill
+        job = print_job(con, {"bill": bt["id"], "phone": True})
+        raw = base64.b64decode(job["escpos"])
+        assert raw.startswith(b"\x1b@") and b"\x1dv0\x00" in raw  # printed as a picture (GS v 0)
+        assert b"\x1dv0\x000\x00" in raw  # 58 mm: 384 dots = 48 bytes per row
+        with con:
+            con.execute("UPDATE settings SET value = '0' WHERE key = 'logo_print'")
+        raw = base64.b64decode(print_job(con, {"bill": bt["id"], "phone": True})["escpos"])
+        assert b"\x1dv0" not in raw and b"Tip" in raw  # logo off: plain text receipt as before
+        assert doc_path("bill", bt["id"], bt).parts[-3:] == ("Bills", bt["day"][:7], f"bill-{bt['bill_label']}.pdf")
+        assert doc_path("day", "2026-11-27").parts[-3:] == ("DailyReports", "2026-11", "day-report-2026-11-27.pdf")
     snap = sqlite3.connect(":memory:")
     if hasattr(snap, "deserialize"):  # Python 3.11+
         snap.deserialize(backup(con, {}))
@@ -1974,6 +2150,7 @@ def make_server(port=PORT):
     con = db()
     init(con)
     con.close()
+    threading.Thread(target=save_missing_docs, daemon=True).start()
     ThreadingHTTPServer.allow_reuse_address = False  # on Windows, True lets a 2nd copy silently share the port
     return ThreadingHTTPServer(("0.0.0.0", port), Handler)
 

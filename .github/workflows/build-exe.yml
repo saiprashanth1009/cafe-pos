@@ -25,8 +25,8 @@ jobs:
           cat build.json
       - name: Build one-file exe
         run: |
-          pip install pyinstaller==6.11.1
-          pyinstaller --onefile --windowed --name CafePOS --add-data "index.html;." --add-data "menu.csv;." --add-data "recipes.csv;." --add-data "build.json;." gui.py
+          pip install pyinstaller==6.11.1 pillow==11.0.0
+          pyinstaller --onefile --windowed --name CafePOS --add-data "index.html;." --add-data "menu.csv;." --add-data "recipes.csv;." --add-data "logo.png;." --add-data "build.json;." gui.py
       - name: Write version.json (build, checksum, change note)
         shell: bash
         env:

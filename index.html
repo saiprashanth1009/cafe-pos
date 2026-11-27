@@ -82,6 +82,8 @@ main>section{padding:12px 16px}
 .minus{color:var(--acc)}.plus{color:var(--ok)}
 .recipe td input{width:110px}
 .del td{text-decoration:line-through;opacity:.55}
+#viewBox{max-height:62vh;overflow:auto;background:#eee;border-radius:10px;padding:8px;text-align:center}
+#viewBox img{max-width:100%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.15)}
 .form{display:grid;gap:12px;max-width:560px}
 .wrap{flex-wrap:wrap}.wrap input{min-width:140px}
 
@@ -127,6 +129,9 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
   #receipt .c{text-align:center}
   #receipt .row{align-items:flex-start}
   #receipt .big{font-size:15px}
+  #receipt{position:relative}
+  #receipt .wm{position:absolute;left:4%;width:92%;top:50%;transform:translateY(-50%);z-index:0}
+  #receipt .rc{position:relative;z-index:1}
 }
 </style>
 </head>
@@ -187,7 +192,7 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
 
 <section id="reports" hidden>
   <div class="bar wrap"><input id="rday" type="date" style="max-width:220px"><span id="dayTag" class="tag"></span>
-    <span style="flex:1"></span><button id="dayBtn" class="pri"></button></div>
+    <span style="flex:1"></span><button id="viewDay" type="button">View day report</button><button id="dayBtn" class="pri"></button></div>
   <div id="rep"></div>
 </section>
 
@@ -272,6 +277,16 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
 </section>
 </main>
 
+<dialog id="viewDlg"><form method="dialog">
+  <h2 id="viewTitle"></h2>
+  <div id="viewBox"><p class="mute">Loading…</p></div>
+  <div class="row wrap" style="gap:8px">
+    <label style="flex-direction:row;align-items:center;gap:6px;margin:0">Save as
+      <select id="viewFmt" style="width:auto"><option value="pdf">PDF</option><option value="jpeg">JPEG picture</option><option value="png">PNG picture</option></select></label>
+    <button type="button" id="viewSave" class="pri">Save</button><button type="button" id="viewPrint">Print</button>
+    <span style="flex:1"></span><button value="close">Close</button></div>
+</form></dialog>
+
 <dialog id="ingDlg"><form id="ingForm">
   <h2 id="ingTitle">Ingredient</h2>
   <input type="hidden" name="ing_id">
@@ -318,6 +333,8 @@ nav .who{color:#fff;border:1px solid #fff3;font-size:14px}
     <div id="discMode" class="seg" style="grid-template-columns:repeat(2,56px)"><button type="button" data-mode="%">%</button><button type="button" data-mode="₹">₹</button></div>
     <input id="bdisc" type="number" min="0" step="0.5" value="0" inputmode="decimal">
   </div>
+  <label>Tip ₹ <small class="mute">(if the customer adds a tip before paying - goes on top of the total, no GST)</small>
+    <input id="btip" type="number" min="0" step="1" inputmode="decimal" placeholder="0"></label>
   <div id="bsum"></div>
   <label>Payment</label>
   <div id="payRows" class="paylines"></div>
@@ -779,11 +796,11 @@ $('#cancelOrder').onclick = () => once(async () => {
 
 // ---------- billing ----------
 let discMode = '%';
-function calc(lines, disc) {  // preview only - mirrors totals() in app.py, which is what actually gets billed
+function calc(lines, disc, tip = 0) {  // preview only - mirrors totals() in app.py, which is what actually gets billed
   const sub = lines.reduce((a, l) => a + l.price * l.qty, 0);
   const dis = discMode === '₹' ? Math.min(Math.round(disc * 100), sub) : Math.round(sub * disc / 100);
   const g = Math.round((sub - dis) * (+S.tax_pct / 2) / 100);
-  return {sub, dis, cgst: g, sgst: g, ro: 0, total: sub - dis + 2 * g};  // no round-off: charged to the paisa
+  return {sub, dis, cgst: g, sgst: g, ro: 0, tip, total: sub - dis + 2 * g + tip};  // no round-off: charged to the paisa
 }
 // pays: [{method, amount}] in paise. One row = the whole bill; more rows = split payment / split between people.
 let pays = [], picked = new Set(), billTotal = 0;
@@ -792,7 +809,7 @@ $('#billBtn').onclick = () => once(async () => {
   if (!await needWhere()) return;
   if (!await sendKot() || !online) return alert('No connection to the POS - the items are queued for the kitchen, but billing needs the connection. Try again in a moment.');
   if (!cur) return;
-  discMode = '%'; $('#bdisc').value = 0; $('#billTitle').textContent = 'Bill · ' + orderTitle(cur);
+  discMode = '%'; $('#bdisc').value = 0; $('#btip').value = ''; $('#billTitle').textContent = 'Bill · ' + orderTitle(cur);
   picked = new Set(cur.lines.map(l => l.id)); pays = [{method: 'UPI', amount: 0}];  // most customers pay by UPI
   $('#splitBox').open = false;
   $('#billLines').innerHTML = cur.lines.map(l => `<label><input type="checkbox" data-line="${l.id}" checked> ${l.qty} × ${esc(l.name)}
@@ -802,13 +819,14 @@ $('#billBtn').onclick = () => once(async () => {
 });
 function renderBill() {
   document.querySelectorAll('#discMode button').forEach(b => b.classList.toggle('on', b.dataset.mode === discMode));
-  const v = +$('#bdisc').value || 0, t = calc(cur.lines.filter(l => picked.has(l.id)), v), h = +S.tax_pct / 2;
+  const v = +$('#bdisc').value || 0, tip = Math.max(0, Math.round((+$('#btip').value || 0) * 100));
+  const t = calc(cur.lines.filter(l => picked.has(l.id)), v, tip), h = +S.tax_pct / 2;
   billTotal = t.total;
   if (pays.length === 1) pays[0].amount = t.total;
   $('#bsum').innerHTML = (picked.size < cur.lines.length ? `<div class="mute">${picked.size} of ${cur.lines.length} items</div>` : '')
     + row('Subtotal', money(t.sub)) + (t.dis ? row(discMode === '%' ? `Discount ${v}%` : 'Discount', '−' + money(t.dis)) : '')
     + (h ? row(`CGST ${h}%`, money(t.cgst)) + row(`SGST ${h}%`, money(t.sgst)) : '') + (t.ro ? row('Round off', money(t.ro)) : '')
-    + row('Total', money(t.total), 'big');
+    + (t.tip ? row('Tip', money(t.tip)) : '') + row('Total', money(t.total), 'big');
   payLeft();
 }
 function renderPays() {  // rebuilds the rows - only on add/remove/split, so typing keeps focus
@@ -859,6 +877,7 @@ $('#billLines').onchange = e => {
   renderBill();
 };
 $('#bdisc').oninput = renderBill;
+$('#btip').oninput = renderBill;
 $('#discMode').onclick = e => { const b = e.target.closest('button'); if (b) { discMode = b.dataset.mode; renderBill(); $('#bdisc').focus() } };
 $('#billForm').onsubmit = e => {
   e.preventDefault();
@@ -866,7 +885,8 @@ $('#billForm').onsubmit = e => {
     const v = +$('#bdisc').value || 0;
     const body = {order_id: cur.id, ...(discMode === '₹' ? {discount_amt: v} : {discount_pct: v}),
       ...(picked.size < cur.lines.length ? {line_ids: [...picked]} : {}),
-      ...(pays.length > 1 ? {payments: pays.map(p => ({method: p.method, amount: (p.amount / 100).toFixed(2)}))} : {payment: pays[0].method})};
+      ...(pays.length > 1 ? {payments: pays.map(p => ({method: p.method, amount: (p.amount / 100).toFixed(2)}))} : {payment: pays[0].method}),
+      tip: $('#btip').value || 0};
     let typed;
     if (v && !can('discount')) {  // someone allowed to give discounts approves it here
       const a = await askConfirmPin(`Give a discount of ${discMode === '%' ? v + '%' : '₹' + v} on ${orderTitle(cur)}?`,
@@ -895,7 +915,8 @@ function directPrint(job) {  // true = printed without the print dialog
 function printReceipt(b) {
   if (directPrint({bill: b.id})) return;
   const h = +b.tax_pct / 2, when = new Date(b.billed).toLocaleString('en-IN', {dateStyle: 'short', timeStyle: 'short'});
-  $('#receipt').innerHTML = `<div class="c"><b class="big">${esc(S.name)}</b>`
+  $('#receipt').innerHTML = (S.logo_print !== '0' ? '<img class="wm" src="/logo-watermark.png" alt="">' : '') + '<div class="rc">'
+    + `<div class="c"><b class="big">${esc(S.name)}</b>`
     + (S.address ? '<br>' + esc(S.address) : '') + (S.phone ? '<br>Ph: ' + esc(S.phone) : '')
     + (S.gstin ? '<br>GSTIN: ' + esc(S.gstin) : '') + (S.fssai ? '<br>FSSAI: ' + esc(S.fssai) : '')
     + (h ? '<br><b>TAX INVOICE</b>' : '<br><b>BILL</b>') + (b.voided ? '<br><b>*** VOID - NOT PAYABLE ***</b>' : '') + '</div><hr>'
@@ -904,9 +925,10 @@ function printReceipt(b) {
     + '<hr>' + b.lines.map(l => row(`${esc(l.name)}<br>&nbsp; ${l.qty} × ${money(l.price)}`, money(l.qty * l.price))).join('')
     + '<hr>' + row('Subtotal', money(b.subtotal)) + (b.discount ? row(+b.discount_pct ? `Discount (${b.discount_pct}%)` : 'Discount', '−' + money(b.discount)) : '')
     + (h ? row(`CGST @ ${h}%`, money(b.cgst)) + row(`SGST @ ${h}%`, money(b.sgst)) : '') + (b.round_off ? row('Round off', money(b.round_off)) : '')
+    + (b.tip ? row('Tip', money(b.tip)) : '')
     + '<hr>' + row('TOTAL', money(b.total), 'big')
     + ((b.payments || []).length > 1 ? '<hr>' + b.payments.map(p => row('Paid ' + esc(p.method), money(p.amount))).join('') : '')
-    + `<hr><div class="c">${esc(S.footer)}</div>`;
+    + `<hr><div class="c">${esc(S.footer)}</div></div>`;
   browserPrint();
 }
 
@@ -966,7 +988,8 @@ async function loadReport() {
       + `<br><small class="mute">cash ${money(r.expenses.cash)} · bank ${money(r.expenses.bank)}</small>`)}</div>` : '';
   $('#rep').innerHTML = bal + `<div class="stats">${tile('Net sales', money(r.net))}${tile('Bills', r.count)}
       ${tile('GST collected', money(s.cgst + s.sgst))}${tile('Discounts given', money(s.discount))}${tile('Cancelled orders', r.cancelled)}
-      ${tile('Voided bills', r.voided.count + (r.voided.count ? ' · ' + money(r.voided.total) : ''))}${tile('Refunds', money(r.refunds))}</div>
+      ${tile('Voided bills', r.voided.count + (r.voided.count ? ' · ' + money(r.voided.total) : ''))}${tile('Refunds', money(r.refunds))}
+      ${r.tips ? tile('Tips (not in sales)', money(r.tips)) : ''}</div>
     <div class="cols">${list('By payment (after refunds)', r.by_payment)}${list('By order type', r.by_type, k => TYPE[k])}</div>
     <div class="card"><h3 style="margin-top:0">Item-wise sales (before discount)</h3><table><tr><th>Item</th><th class="r">Qty</th><th class="r">Amount</th></tr>
       ${r.items.map(([n, q, a]) => `<tr><td>${esc(n)}</td><td class="r">${q}</td><td class="r">${money(a)}</td></tr>`).join('')}</table></div>
@@ -974,7 +997,7 @@ async function loadReport() {
       ${r.bills.map(b => `<tr class="${b.voided ? 'void' : ''}"><td>${b.day_no ?? b.bill_no}</td><td>${b.billed.slice(11, 16)}</td><td>${TYPE[b.type]}${b.table_no ? ' T' + b.table_no : ''}</td>
         <td>${b.payments.length > 1 ? b.payments.map(p => esc(p.method) + ' ' + money(p.amount)).join(' + ') : esc(b.payment)}</td>
         <td class="r">${money(b.total)}${b.refunded ? `<br><small class="mute">refunded ${money(b.refunded)}</small>` : ''}</td>
-        <td class="r" style="white-space:nowrap">${b.voided ? `<span class="tag" title="${esc(b.void_reason)}">VOID</span> ` : ''}<button data-reprint="${b.id}">Reprint</button>
+        <td class="r" style="white-space:nowrap">${b.voided ? `<span class="tag" title="${esc(b.void_reason)}">VOID</span> ` : ''}<button data-view="${b.id}">View</button> <button data-reprint="${b.id}">Reprint</button>
           ${b.voided ? '' : `<button data-refund="${b.id}">Refund</button> <button class="warn" data-void="${b.id}">Void</button>`}</td></tr>`).join('')}</table></div>
     <div class="card"><h3 style="margin-top:0">Audit log - who did what</h3>${aud.length ? `<table><tr><th>Time</th><th>Who</th><th>What</th><th class="r">Amount</th><th>Reason / details</th></tr>
       ${aud.map(a => `<tr><td>${a.at.slice(11, 16)}</td><td><b>${esc(a.who || a.role)}</b><br><small class="mute">${esc(a.role)}${a.device ? ' · ' + esc(a.device) : ''}</small></td>
@@ -984,7 +1007,8 @@ async function loadReport() {
 }
 $('#rep').onclick = e => {
   const t = e.target.closest('button')?.dataset; if (!t) return;
-  const b = lastBills.find(x => x.id === +(t.reprint || t.refund || t.void));
+  const b = lastBills.find(x => x.id === +(t.reprint || t.refund || t.void || t.view));
+  if (t.view) return viewDoc('bill=' + b.id, `Bill ${b.bill_label}`, () => printReceipt(b));
   if (t.reprint) return printReceipt(b);
   const label = `bill ${b.bill_label} (${money(b.total)})`;
   if (t.void) once(async () => {
@@ -1024,14 +1048,43 @@ function printDayReport(r) {  // end-of-day report (Z report)
     + row('Gross (before discount)', money(s.subtotal)) + row('Discounts', '−' + money(s.discount))
     + (s.cgst || s.sgst ? row(`CGST @ ${h}%`, money(s.cgst)) + row(`SGST @ ${h}%`, money(s.sgst)) : '') + (s.round_off ? row('Round off', money(s.round_off)) : '')
     + (r.voided?.count ? row(`Voided bills (${r.voided.count})`, money(r.voided.total)) : '')
-    + (r.refunds ? row('Bills total', money(s.total)) + row('Refunds', '−' + money(r.refunds)) : '')
-    + '<hr>' + row('NET SALES', money(r.net ?? s.total), 'big') + '<hr><b>By payment</b>'
+    + (r.refunds ? row('Refunds', '−' + money(r.refunds)) : '')
+    + '<hr>' + row('NET SALES', money(r.net ?? s.total), 'big') + (r.tips ? row('Tips (not in sales)', money(r.tips)) : '')
+    + '<hr><b>By payment</b>'
     + (Object.entries(r.by_payment).map(([k, v]) => row(esc(k), money(v))).join('') || '<div>-</div>')
     + '<hr><b>By order type</b>' + (Object.entries(r.by_type).map(([k, v]) => row(TYPE[k], money(v))).join('') || '<div>-</div>')
     + '<hr><b>Items sold</b>' + (r.items.map(([n, q, a]) => row(`${q} × ${esc(n)}`, money(a))).join('') || '<div>-</div>')
     + '<hr><div class="c">--- end of report ---</div>';
   browserPrint();
 }
+
+// ---------- view / save a bill or day report (PDF, JPEG, PNG with the logo) ----------
+let viewing = null;
+async function fetchDoc(qs) {
+  const r = await fetch('/api/doc?' + qs, {headers: {'X-Pin': pin, 'X-Device': store('device'), ...(PROFILE ? {'X-Profile': PROFILE} : {})}});
+  if (!r.ok) { let e = 'Could not open it'; try { e = (await r.json()).error } catch {} throw new Error(e) }
+  const name = (r.headers.get('Content-Disposition') || '').match(/filename="([^"]+)"/)?.[1] || 'cafepos';
+  return {blob: await r.blob(), name};
+}
+async function viewDoc(qs, title, print) {
+  viewing = {qs, print};
+  $('#viewTitle').textContent = title; $('#viewBox').innerHTML = '<p class="mute">Loading…</p>';
+  $('#viewDlg').showModal();
+  try {
+    const {blob} = await fetchDoc(qs + '&fmt=png');
+    $('#viewBox').innerHTML = `<img alt="${esc(title)}" src="${URL.createObjectURL(blob)}">`;
+  } catch (e) { $('#viewBox').innerHTML = `<p class="mute">${esc(e.message)}</p>` }
+}
+$('#viewSave').onclick = () => once(async () => {
+  try {
+    const {blob, name} = await fetchDoc(viewing.qs + '&fmt=' + $('#viewFmt').value);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  } catch (e) { alert(e.message) }
+});
+$('#viewPrint').onclick = () => { $('#viewDlg').close(); viewing?.print?.() };
+$('#viewDay').onclick = () => { const r = lastReport; if (r) viewDoc('day=' + r.day, 'Day report · ' + fmtDay(r.day), () => printDayReport(r)) };
 
 // ---------- inventory ----------
 let INV = {ingredients: [], recipes: {}, moves: []}, invFilter = '', recRows = [];
@@ -1233,12 +1286,13 @@ const FIELDS = [['name', 'Restaurant name'], ['address', 'Address'], ['phone', '
   ['fssai', 'FSSAI licence no. (required on bills)'], ['tax_pct', 'GST % (split equally into CGST + SGST). 0 = no GST: bills are the menu prices and receipts show no GST lines'],
   ['tables', 'Number of dine-in tables'], ['footer', 'Receipt footer'],
   ['printer', 'Receipt printer (USB: plug it into the counter PC and press Connect in the CafePOS window; Bluetooth: pair it first)'],
-  ['paper', 'Paper width'], ['dark', 'Print darkness'],
+  ['paper', 'Paper width'], ['dark', 'Print darkness'], ['logo_print', 'Logo on printed bills'],
   ['owner_pin', 'New OWNER PIN, 6+ digits (blank = keep current). Only the owner can then change the menu, give discounts, cancel/void/refund, close the day and see reports.'],
   ['pin', 'New STAFF PIN, 6+ digits (blank = keep current). Staff take orders, bill and run the kitchen.']];
 const PINS = ['pin', 'owner_pin'];
 const fieldInput = k => k === 'printer' ? '<select name="printer"><option value="">No printer - use the print dialog</option></select>'
   : k === 'paper' ? '<select name="paper"><option value="58">58 mm (2 inch)</option><option value="80">80 mm (3 inch)</option></select>'
+  : k === 'logo_print' ? '<select name="logo_print"><option value="1">Faded logo in the background (the bill prints as a picture)</option><option value="0">No logo - plain text, fastest</option></select>'
   : k === 'dark' ? '<select name="dark"><option value="1">Dark (bold) - easier to read on small printers</option><option value="0">Normal</option></select>'
   : `<input name="${k}" ${PINS.includes(k) ? 'type="password" inputmode="numeric"' : ''} autocomplete="off">`;
 $('#setForm').innerHTML = FIELDS.map(([k, l]) => `<label>${l}${fieldInput(k)}</label>`).join('')
